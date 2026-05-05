@@ -157,7 +157,7 @@ class ServiceRegistry:
       return self._memory_factories[scheme](uri, **kwargs)
     return None
 
-  def create_task_store_service(self, uri: str, **kwargs) -> Any:
+  def create_task_store_service(self, uri: str, **kwargs: Any) -> Any:
     """Create A2A task store from URI using registered factories."""
     scheme = urlparse(uri).scheme
     if scheme and scheme in self._task_store_factories:
@@ -348,12 +348,12 @@ def _register_builtin_services(registry: ServiceRegistry) -> None:
   registry.register_memory_service("agentengine", agentengine_memory_factory)
 
   # -- A2A Task Store Services --
-  def memory_task_store_factory(uri: str, **kwargs):
+  def memory_task_store_factory(uri: str, **kwargs: Any) -> Any:
     from a2a.server.tasks import InMemoryTaskStore
 
     return InMemoryTaskStore()
 
-  def database_task_store_factory(uri: str, **kwargs):
+  def database_task_store_factory(uri: str, **kwargs: Any) -> Any:
     from a2a.server.tasks import DatabaseTaskStore
     from sqlalchemy.ext.asyncio import create_async_engine
 
