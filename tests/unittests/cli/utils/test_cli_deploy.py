@@ -714,6 +714,13 @@ def test_to_agent_engine_triggers_onboarding(
       cli_deploy._onboarding, "handle_login_with_google", mock_handle_login
   )
 
+  # Mock subprocess.run to avoid calling gcloud
+  monkeypatch.setattr(
+      subprocess,
+      "run",
+      lambda *a, **k: types.SimpleNamespace(stdout="fake-project\n"),
+  )
+
   fake_vertexai = types.ModuleType("vertexai")
 
   class _FakeAgentEngines:
