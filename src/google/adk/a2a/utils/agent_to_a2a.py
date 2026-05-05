@@ -26,6 +26,7 @@ from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryPushNotificationConfigStore
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.server.tasks import PushNotificationConfigStore
+from a2a.server.tasks import TaskStore
 from a2a.types import AgentCard
 from starlette.applications import Starlette
 
@@ -84,6 +85,7 @@ def to_a2a(
     protocol: str = "http",
     agent_card: Optional[Union[AgentCard, str]] = None,
     push_config_store: Optional[PushNotificationConfigStore] = None,
+    task_store: Optional[TaskStore] = None,
     runner: Optional[Runner] = None,
     lifespan: Optional[Callable[[Starlette], AsyncIterator[None]]] = None,
 ) -> Starlette:
@@ -100,6 +102,8 @@ def to_a2a(
       push_config_store: Optional A2A push notification config store. If not
         provided, an in-memory store will be created so push-notification
         config RPC methods are supported.
+      task_store: Optional A2A task store for persisting task state. If not
+        provided, an in-memory store will be created.
       runner: Optional pre-built Runner object. If not provided, a default
               runner will be created using in-memory services.
       lifespan: Optional async context manager for Starlette lifespan
@@ -127,6 +131,11 @@ def to_a2a(
           await app.state.db.close()
 
       app = to_a2a(agent, lifespan=lifespan)
+
+      # Or with a persistent task store:
+      from a2a.server.tasks import DatabaseTaskStore
+      task_store = DatabaseTaskStore(db_url="postgresql+asyncpg://...")
+      app = to_a2a(agent, task_store=task_store)
   """
   # Set up ADK logging to ensure logs are visible when using uvicorn directly
   adk_logger = logging.getLogger("google_adk")
@@ -145,7 +154,8 @@ def to_a2a(
     )
 
   # Create A2A components
-  task_store = InMemoryTaskStore()
+  if task_store is None:
+    task_store = InMemoryTaskStore()
 
   agent_executor = A2aAgentExecutor(
       runner=runner or create_runner,

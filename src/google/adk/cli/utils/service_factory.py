@@ -326,3 +326,30 @@ def create_artifact_service_from_options(
         base_path,
         exc,
     )
+
+
+def create_task_store_from_options(
+    *,
+    task_store_uri: Optional[str] = None,
+) -> Any:
+  """Creates an A2A task store based on CLI/web options."""
+  from a2a.server.tasks import InMemoryTaskStore
+
+  registry = get_service_registry()
+
+  if task_store_uri:
+    logger.info(
+        "Using A2A task store URI: %s",
+        _redact_uri_for_log(task_store_uri),
+    )
+    service = registry.create_task_store_service(task_store_uri)
+    if service is not None:
+      return service
+
+    raise ValueError(
+        "Unsupported A2A task store URI: %s"
+        % _redact_uri_for_log(task_store_uri)
+    )
+
+  logger.info("Using in-memory A2A task store")
+  return InMemoryTaskStore()

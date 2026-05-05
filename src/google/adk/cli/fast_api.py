@@ -51,6 +51,7 @@ from .utils.base_agent_loader import BaseAgentLoader
 from .utils.service_factory import create_artifact_service_from_options
 from .utils.service_factory import create_memory_service_from_options
 from .utils.service_factory import create_session_service_from_options
+from .utils.service_factory import create_task_store_from_options
 
 logger = logging.getLogger("google_adk." + __name__)
 
@@ -85,6 +86,7 @@ def get_fast_api_app(
     allow_origins: Optional[list[str]] = None,
     web: bool,
     a2a: bool = False,
+    task_store_uri: Optional[str] = None,
     host: str = "127.0.0.1",
     port: int = 8000,
     url_prefix: Optional[str] = None,
@@ -128,6 +130,8 @@ def get_fast_api_app(
     allow_origins: List of allowed origins for CORS.
     web: Whether to enable the web UI and serve its assets.
     a2a: Whether to enable Agent-to-Agent (A2A) protocol support.
+    task_store_uri: URI for the A2A task store. Uses in-memory task store if
+      None. Only used when ``a2a=True``.
     host: Host address for the server (defaults to 127.0.0.1).
     port: Port number for the server (defaults to 8000).
     url_prefix: Optional prefix for all URL routes.
@@ -588,7 +592,6 @@ def get_fast_api_app(
     from a2a.server.apps import A2AStarletteApplication
     from a2a.server.request_handlers import DefaultRequestHandler
     from a2a.server.tasks import InMemoryPushNotificationConfigStore
-    from a2a.server.tasks import InMemoryTaskStore
     from a2a.types import AgentCard
     from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
 
@@ -598,7 +601,9 @@ def get_fast_api_app(
     base_path = Path.cwd() / agents_dir
     # the root agents directory should be an existing folder
     if base_path.exists() and base_path.is_dir():
-      a2a_task_store = InMemoryTaskStore()
+      a2a_task_store = create_task_store_from_options(
+          task_store_uri=task_store_uri,
+      )
 
       def create_a2a_runner_loader(captured_app_name: str):
         """Factory function to create A2A runner with proper closure."""

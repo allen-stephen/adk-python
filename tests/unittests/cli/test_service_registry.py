@@ -172,14 +172,37 @@ def test_create_memory_service_memory(registry):
   assert isinstance(memory_service, InMemoryMemoryService)
 
 
+# Task Store Tests
+def test_create_task_store_memory(registry):
+  from a2a.server.tasks import InMemoryTaskStore
+
+  task_store = registry.create_task_store_service("memory://")
+  assert isinstance(task_store, InMemoryTaskStore)
+
+
+@patch("sqlalchemy.ext.asyncio.create_async_engine")
+@patch("a2a.server.tasks.DatabaseTaskStore")
+def test_create_task_store_postgresql(
+    mock_db_task_store, mock_create_engine, registry
+):
+  mock_engine = mock_create_engine.return_value
+  registry.create_task_store_service("postgresql+asyncpg://user:pass@host/db")
+  mock_create_engine.assert_called_once_with(
+      "postgresql+asyncpg://user:pass@host/db"
+  )
+  mock_db_task_store.assert_called_once_with(engine=mock_engine)
+
+
 # General Tests
 def test_unsupported_scheme(registry, mock_services):
   session_service = registry.create_session_service("unsupported://foo")
   artifact_service = registry.create_artifact_service("unsupported://foo")
   memory_service = registry.create_memory_service("unsupported://foo")
+  task_store = registry.create_task_store_service("unsupported://foo")
   assert session_service is None
   assert artifact_service is None
   assert memory_service is None
+  assert task_store is None
   for service in [
       "vertex_session",
       "db_session",
