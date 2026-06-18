@@ -21,12 +21,13 @@ from typing_extensions import override
 from .eval_case import ConversationScenario
 from .eval_case import Invocation
 from .eval_metrics import EvalMetric
+from .evaluator import BatchableEvaluator
 from .evaluator import EvaluationResult
-from .evaluator import Evaluator
+from .vertex_ai_eval_facade import _BatchMetricSpec
 from .vertex_ai_eval_facade import _MultiTurnVertexiAiEvalFacade
 
 
-class MultiTurnTrajectoryQualityV1Evaluator(Evaluator):
+class MultiTurnTrajectoryQualityV1Evaluator(BatchableEvaluator):
   """Evaluates the overall trajectory of the conversation.
 
   Note that this metric is different from `Multi-Turn Overall Task Success`,
@@ -66,4 +67,34 @@ class MultiTurnTrajectoryQualityV1Evaluator(Evaluator):
         metric_name=vertexai.types.RubricMetric.MULTI_TURN_TRAJECTORY_QUALITY,
     ).evaluate_invocations(
         actual_invocations, expected_invocations, conversation_scenario
+    )
+
+  @override
+  def get_batch_group_key(self) -> str:
+    return "vertex_multi_turn"
+
+  @override
+  def get_batch_spec(self) -> _BatchMetricSpec:
+    from ..dependencies.vertexai import vertexai
+
+    return _BatchMetricSpec(
+        adk_metric_name=self._eval_metric.metric_name,
+        metric=vertexai.types.RubricMetric.MULTI_TURN_TRAJECTORY_QUALITY,
+        threshold=self._eval_metric.threshold,
+    )
+
+  @override
+  def evaluate_batch(
+      self,
+      batch_specs: list[_BatchMetricSpec],
+      actual_invocations: list[Invocation],
+      expected_invocations: Optional[list[Invocation]] = None,
+  ) -> dict[str, EvaluationResult]:
+    from ..dependencies.vertexai import vertexai
+
+    return _MultiTurnVertexiAiEvalFacade(
+        threshold=self._eval_metric.threshold,
+        metric_name=vertexai.types.RubricMetric.MULTI_TURN_TRAJECTORY_QUALITY,
+    ).evaluate_invocations_for_metrics(
+        batch_specs, actual_invocations, expected_invocations
     )

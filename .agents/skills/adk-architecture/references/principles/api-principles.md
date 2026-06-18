@@ -40,3 +40,23 @@ The public API surface of ADK includes:
 **Private Naming**
 - **Good**: `_prepare_context_for_llm()`, `_should_trim_history()`
 - **Bad**: `_prep()`, `_trim()`
+
+## Evaluation Results
+
+### Backend-Authoritative Pass/Fail
+- Eval pass/fail is computed **only** in adk-python and exposed as `eval_status`
+  (per metric, per invocation) and `final_eval_status` (per eval case), using
+  `EvalStatus` (`PASSED` / `FAILED` / `NOT_EVALUATED`).
+- Clients (e.g. the adk-web UI) must **read** these status fields to render
+  pass/fail. They must **never** re-derive status by comparing `score` against
+  `threshold` themselves. Score-vs-threshold direction varies per metric (e.g.
+  latency is "lower is better"), so client-side recomputation is error-prone and
+  has caused incorrect FAIL badges.
+- `score` and `threshold` may be displayed for context, but the visual pass/fail
+  state must key off the backend status.
+
+### Metric Result Detail
+- Reasoning behind a metric result (rubric verdicts and free-text explanations
+  from managed metrics) is carried on `EvalMetricResult.details`
+  (`rubric_scores` with per-rubric `verdict` / `rationale`, and `explanation`).
+  Surface this in clients rather than re-deriving or omitting it.

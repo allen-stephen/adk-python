@@ -395,6 +395,23 @@ class TestLocalEvalSetsManager:
     with pytest.raises(ValueError, match="Invalid Eval Set ID"):
       local_eval_sets_manager.create_eval_set(app_name, eval_set_id)
 
+  def test_local_eval_sets_manager_delete_eval_set_success(
+      self, local_eval_sets_manager
+  ):
+    app_name = "test_app"
+    eval_set_id = "deletable_set"
+    local_eval_sets_manager.create_eval_set(app_name, eval_set_id)
+
+    local_eval_sets_manager.delete_eval_set(app_name, eval_set_id)
+
+    assert local_eval_sets_manager.get_eval_set(app_name, eval_set_id) is None
+
+  def test_local_eval_sets_manager_delete_eval_set_not_found(
+      self, local_eval_sets_manager
+  ):
+    with pytest.raises(NotFoundError):
+      local_eval_sets_manager.delete_eval_set("test_app", "nonexistent_set")
+
   def test_local_eval_sets_manager_create_eval_set_already_exists(
       self, local_eval_sets_manager, mocker
   ):

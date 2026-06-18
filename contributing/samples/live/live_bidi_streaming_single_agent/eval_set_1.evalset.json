@@ -1,0 +1,34 @@
+{
+  "eval_set_id": "eval_set_1",
+  "name": "eval_set_1",
+  "eval_cases": [
+    {
+      "eval_id": "Dice_Player_persona",
+      "live_persona_scenario": {
+        "persona": {
+          "id": "Dice_Player",
+          "description": "Dice Player",
+          "character_prompt": "You are a curious, friendly person who loves dice games and wants to roll some dice and check if numbers are prime.",
+          "goal": "Roll a 20-sided die, then ask whether the result is a prime number."
+        },
+        "max_turns": 6
+      },
+      "creation_timestamp": 1781747878.713116
+    },
+    {
+      "eval_id": "Dice_Player_2_persona",
+      "live_persona_scenario": {
+        "persona": {
+          "id": "Dice_Player_2",
+          "description": "Dice Player 2",
+          "character_prompt": "Super terse and annoyed player, just want to get to the point.",
+          "goal": "Roll a 6 sided dice and confirm the number isn't prime.",
+          "voice_name": "Fenrir"
+        },
+        "max_turns": 6
+      },
+      "creation_timestamp": 1781754732.4576268
+    }
+  ],
+  "creation_timestamp": 1781747824.030553
+}

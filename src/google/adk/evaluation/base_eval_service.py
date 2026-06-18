@@ -29,6 +29,7 @@ from .constants import DEFAULT_LIVE_TIMEOUT_SECONDS
 from .eval_case import Invocation
 from .eval_metrics import EvalMetric
 from .eval_result import EvalCaseResult
+from .simulation.live_conversation_scenario import LiveConversationScenario
 
 
 class EvaluateConfig(BaseModel):
@@ -86,6 +87,14 @@ could also overwhelm those tools.""",
       default=False,
       description="""Whether to use live (bidirectional streaming) mode for
 inference. This is required for Live API models (e.g., gemini-*-live-*).""",
+  )
+
+  live_persona_scenario: Optional[LiveConversationScenario] = Field(
+      default=None,
+      description="""When set, run a persona-driven audio-to-audio live
+conversation: a synthetic persona agent speaks with the agent under test, both
+in audio. This is the live-native evaluation path and takes precedence over the
+text-driven `use_live` path.""",
   )
 
   live_timeout_seconds: int = Field(

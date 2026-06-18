@@ -25,8 +25,10 @@ from .eval_metrics import PrebuiltMetrics
 from .evaluator import Evaluator
 from .final_response_match_v2 import FinalResponseMatchV2Evaluator
 from .hallucinations_v1 import HallucinationsV1Evaluator
+from .latency_evaluator import LatencyV1Evaluator
 from .metric_info_providers import FinalResponseMatchV2EvaluatorMetricInfoProvider
 from .metric_info_providers import HallucinationsV1EvaluatorMetricInfoProvider
+from .metric_info_providers import LatencyV1MetricInfoProvider
 from .metric_info_providers import MultiTurnTaskSuccessV1MetricInfoProvider
 from .metric_info_providers import MultiTurnToolUseQualityV1MetricInfoProvider
 from .metric_info_providers import MultiTurnTrajectoryQualityV1MetricInfoProvider
@@ -169,6 +171,10 @@ def _get_default_metric_evaluator_registry() -> MetricEvaluatorRegistry:
   metric_evaluator_registry.register_evaluator(
       metric_info=RubricBasedMultiTurnTrajectoryMetricInfoProvider().get_metric_info(),
       evaluator=RubricBasedMultiTurnTrajectoryEvaluator,
+  )
+  metric_evaluator_registry.register_evaluator(
+      metric_info=LatencyV1MetricInfoProvider().get_metric_info(),
+      evaluator=LatencyV1Evaluator,
   )
 
   return metric_evaluator_registry

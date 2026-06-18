@@ -28,6 +28,7 @@ from .app_details import AppDetails
 from .common import EvalBaseModel
 from .conversation_scenarios import ConversationScenario
 from .eval_rubrics import Rubric
+from .simulation.live_conversation_scenario import LiveConversationScenario
 
 
 class IntermediateData(EvalBaseModel):
@@ -67,6 +68,12 @@ class InvocationEvent(EvalBaseModel):
   content: Optional[genai_types.Content]
   """The content of the event."""
 
+  timestamp: Optional[float] = None
+  """The time the event was created, in seconds since the epoch.
+
+  Primarily used by acoustic metrics (e.g. latency) for live (voice) eval.
+  """
+
 
 class InvocationEvents(EvalBaseModel):
   """A container for events that occur during the course of an invocation."""
@@ -78,6 +85,28 @@ class InvocationEvents(EvalBaseModel):
 IntermediateDataType: TypeAlias = Union[IntermediateData, InvocationEvents]
 
 
+class AudioReference(EvalBaseModel):
+  """A reference to audio bytes stored in the artifact service.
+
+  Audio for a live (voice) eval case is not inlined in the eval set JSON.
+  Instead the bytes are persisted via the ArtifactService and this reference
+  records how to retrieve and interpret them. This keeps eval set files small
+  while still making the conversation audio inspectable and reproducible.
+  """
+
+  artifact_filename: str
+  """The artifact filename under which the audio is stored."""
+
+  version: Optional[int] = None
+  """The artifact version. If None, the latest version is used."""
+
+  mime_type: str = "audio/pcm;rate=16000"
+  """The MIME type of the audio, including the sample rate when applicable."""
+
+  sample_rate_hz: int = 16000
+  """The sample rate of the audio in Hertz."""
+
+
 class Invocation(EvalBaseModel):
   """Represents a single invocation."""
 
@@ -87,8 +116,22 @@ class Invocation(EvalBaseModel):
   user_content: genai_types.Content
   """Content provided by the user in this invocation."""
 
+  user_audio: Optional[AudioReference] = None
+  """Reference to the user's audio input for this invocation, if any.
+
+  Populated for live (voice) eval cases. The transcript of this audio is carried
+  in `user_content`.
+  """
+
   final_response: Optional[genai_types.Content] = None
   """Final response from the agent."""
+
+  agent_audio: Optional[AudioReference] = None
+  """Reference to the agent's audio response for this invocation, if any.
+
+  Populated for live (voice) eval cases. The transcript of this audio is carried
+  in `final_response`.
+  """
 
   intermediate_data: Optional[IntermediateDataType] = None
   """Intermediate steps generated as a part of Agent execution.
@@ -154,6 +197,15 @@ class EvalCase(EvalBaseModel):
   `conversation_scenario`, but not both.
   """
 
+  live_persona_scenario: Optional[LiveConversationScenario] = None
+  """A persona-driven audio-to-audio live conversation to run for this case.
+
+  When set, this eval case represents a persona (voice) eval: a synthetic
+  persona agent holds a spoken conversation with the agent under test. The
+  conversation turns are generated fresh each run, so a persona case does not
+  carry a static `conversation` or a text `conversation_scenario`.
+  """
+
   session_input: Optional[SessionInput] = None
   """Session input that will be passed on to the Agent during eval.
      It is common for Agents state to be initialized to some initial/default value,
@@ -172,11 +224,25 @@ class EvalCase(EvalBaseModel):
   """The expected final session state at the end of the conversation."""
 
   @model_validator(mode="after")
-  def ensure_conversation_xor_conversation_scenario(self) -> EvalCase:
+  def ensure_valid_eval_case_input(self) -> EvalCase:
+    # A persona (live voice) case is defined solely by its live_persona_scenario
+    # and carries neither a static conversation nor a text conversation_scenario.
+    if self.live_persona_scenario is not None:
+      if (
+          self.conversation is not None
+          or self.conversation_scenario is not None
+      ):
+        raise ValueError(
+            "A live_persona_scenario eval case must not also provide a"
+            " conversation or conversation_scenario."
+        )
+      return self
+
+    # Otherwise, exactly one of conversation / conversation_scenario is required.
     if (self.conversation is None) == (self.conversation_scenario is None):
       raise ValueError(
-          "Exactly one of conversation and conversation_scenario must be"
-          " provided in an EvalCase."
+          "Exactly one of conversation, conversation_scenario and"
+          " live_persona_scenario must be provided in an EvalCase."
       )
     return self
 

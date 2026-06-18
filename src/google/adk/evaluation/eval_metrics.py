@@ -71,6 +71,8 @@ class PrebuiltMetrics(Enum):
       "rubric_based_multi_turn_trajectory_quality_v1"
   )
 
+  RESPONSE_LATENCY_V1 = "response_latency_v1"
+
 
 MetricName: TypeAlias = Union[str, PrebuiltMetrics]
 Threshold: TypeAlias = float
@@ -306,6 +308,15 @@ class EvalMetricResultDetails(EvalBaseModel):
       description=(
           "The scores obtained after applying the rubrics to the Agent's"
           " response."
+      ),
+  )
+
+  explanation: Optional[str] = Field(
+      default=None,
+      description=(
+          "A free-text explanation of the metric result, when the underlying"
+          " metric provides one (e.g. the managed Gen AI Eval Service returns a"
+          " per-case explanation alongside rubric verdicts)."
       ),
   )
 

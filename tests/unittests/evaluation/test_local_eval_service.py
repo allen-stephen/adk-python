@@ -39,6 +39,7 @@ from google.adk.evaluation.eval_set import EvalCase
 from google.adk.evaluation.eval_set import EvalSet
 from google.adk.evaluation.eval_set_results_manager import EvalSetResultsManager
 from google.adk.evaluation.eval_sets_manager import EvalSetsManager
+from google.adk.evaluation.evaluator import BatchableEvaluator
 from google.adk.evaluation.evaluator import EvalStatus
 from google.adk.evaluation.evaluator import EvaluationResult
 from google.adk.evaluation.evaluator import Evaluator
@@ -81,6 +82,15 @@ def eval_service(
       metric_info=FakeSingleSidedEvaluator.get_metric_info(),
       evaluator=FakeSingleSidedEvaluator,
   )
+  DEFAULT_METRIC_EVALUATOR_REGISTRY.register_evaluator(
+      metric_info=FakeBatchableEvaluator.get_metric_info("fake_batch_metric_a"),
+      evaluator=FakeBatchableEvaluatorA,
+  )
+  DEFAULT_METRIC_EVALUATOR_REGISTRY.register_evaluator(
+      metric_info=FakeBatchableEvaluator.get_metric_info("fake_batch_metric_b"),
+      evaluator=FakeBatchableEvaluatorB,
+  )
+  FakeBatchableEvaluator.reset()
   return LocalEvalService(
       root_agent=dummy_agent,
       eval_sets_manager=mock_eval_sets_manager,
@@ -167,6 +177,223 @@ class FakeSingleSidedEvaluator(Evaluator):
     )
 
 
+class FakeBatchableEvaluator(BatchableEvaluator):
+  """A batchable evaluator that records how its batched call was invoked.
+
+  Two concrete subclasses (`FakeBatchableEvaluatorA`/`B`) share the same batch
+  group key, so the service should compute both in one `evaluate_batch` call.
+  """
+
+  metric_name: str = "fake_batch_metric"
+
+  # Class-level bookkeeping shared across instances/subclasses so tests can
+  # assert how many batched calls were made and with which specs.
+  batch_call_count: int = 0
+  last_batch_spec_names: list[str] = []
+
+  def __init__(self, eval_metric: EvalMetric):
+    self._eval_metric = eval_metric
+
+  @classmethod
+  def reset(cls) -> None:
+    FakeBatchableEvaluator.batch_call_count = 0
+    FakeBatchableEvaluator.last_batch_spec_names = []
+
+  @staticmethod
+  def get_metric_info(metric_name: str) -> MetricInfo:
+    return MetricInfo(
+        metric_name=metric_name,
+        description="Fake batchable metric description",
+        metric_value_info=MetricValueInfo(
+            interval=Interval(min_value=0.0, max_value=1.0)
+        ),
+    )
+
+  @override
+  def evaluate_invocations(
+      self,
+      actual_invocations: list[Invocation],
+      expected_invocations: Optional[list[Invocation]] = None,
+      conversation_scenario: Optional[ConversationScenario] = None,
+  ) -> EvaluationResult:
+    return EvaluationResult(
+        overall_score=0.9,
+        overall_eval_status=EvalStatus.PASSED,
+        per_invocation_results=[
+            PerInvocationResult(
+                actual_invocation=actual,
+                score=0.9,
+                eval_status=EvalStatus.PASSED,
+            )
+            for actual in actual_invocations
+        ],
+    )
+
+  @override
+  def get_batch_group_key(self) -> str:
+    return "fake_batch_group"
+
+  @override
+  def get_batch_spec(self) -> str:
+    return self._eval_metric.metric_name
+
+  @override
+  def evaluate_batch(
+      self,
+      batch_specs: list[str],
+      actual_invocations: list[Invocation],
+      expected_invocations: Optional[list[Invocation]] = None,
+  ) -> dict[str, EvaluationResult]:
+    FakeBatchableEvaluator.batch_call_count += 1
+    FakeBatchableEvaluator.last_batch_spec_names = list(batch_specs)
+    results: dict[str, EvaluationResult] = {}
+    for spec in batch_specs:
+      results[spec] = EvaluationResult(
+          overall_score=0.9,
+          overall_eval_status=EvalStatus.PASSED,
+          per_invocation_results=[
+              PerInvocationResult(
+                  actual_invocation=actual,
+                  score=0.9,
+                  eval_status=EvalStatus.PASSED,
+              )
+              for actual in actual_invocations
+          ],
+      )
+    return results
+
+
+class FakeBatchableEvaluatorA(FakeBatchableEvaluator):
+  metric_name = "fake_batch_metric_a"
+
+
+class FakeBatchableEvaluatorB(FakeBatchableEvaluator):
+  metric_name = "fake_batch_metric_b"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_single_inference_result_batches_metrics(
+    eval_service, mock_eval_sets_manager, mocker
+):
+  """Metrics sharing a batch group are computed in a single batched call."""
+  invocation = Invocation(
+      user_content=genai_types.Content(
+          parts=[genai_types.Part(text="test user content.")]
+      ),
+      final_response=genai_types.Content(
+          parts=[genai_types.Part(text="test final response.")]
+      ),
+  )
+  inference_result = InferenceResult(
+      app_name="test_app",
+      eval_set_id="test_eval_set",
+      eval_case_id="case1",
+      inferences=[invocation.model_copy(deep=True)],
+      session_id="session1",
+  )
+  evaluate_config = EvaluateConfig(
+      eval_metrics=[
+          EvalMetric(metric_name="fake_batch_metric_a", threshold=0.5),
+          EvalMetric(metric_name="fake_batch_metric_b", threshold=0.5),
+      ],
+      parallelism=1,
+  )
+
+  mock_eval_case = mocker.MagicMock(spec=EvalCase)
+  mock_eval_case.conversation = [invocation.model_copy(deep=True)]
+  mock_eval_case.conversation_scenario = None
+  mock_eval_case.live_persona_scenario = None
+  mock_eval_case.session_input = None
+  mock_eval_sets_manager.get_eval_case.return_value = mock_eval_case
+
+  _, result = await eval_service._evaluate_single_inference_result(
+      inference_result=inference_result, evaluate_config=evaluate_config
+  )
+
+  # Both metrics computed via a single batched call.
+  assert FakeBatchableEvaluator.batch_call_count == 1
+  assert set(FakeBatchableEvaluator.last_batch_spec_names) == {
+      "fake_batch_metric_a",
+      "fake_batch_metric_b",
+  }
+  # Both metrics still produce overall results.
+  metric_names = {r.metric_name for r in result.overall_eval_metric_results}
+  assert metric_names == {"fake_batch_metric_a", "fake_batch_metric_b"}
+  for overall in result.overall_eval_metric_results:
+    assert overall.score == 0.9
+    assert overall.eval_status == EvalStatus.PASSED
+
+
+@pytest.mark.asyncio
+async def test_evaluate_single_inference_result_single_batchable_metric_not_batched(
+    eval_service, mock_eval_sets_manager, mocker
+):
+  """A lone batchable metric runs via the standard path (no batched call)."""
+  invocation = Invocation(
+      user_content=genai_types.Content(
+          parts=[genai_types.Part(text="test user content.")]
+      ),
+      final_response=genai_types.Content(
+          parts=[genai_types.Part(text="test final response.")]
+      ),
+  )
+  inference_result = InferenceResult(
+      app_name="test_app",
+      eval_set_id="test_eval_set",
+      eval_case_id="case1",
+      inferences=[invocation.model_copy(deep=True)],
+      session_id="session1",
+  )
+  evaluate_config = EvaluateConfig(
+      eval_metrics=[
+          EvalMetric(metric_name="fake_batch_metric_a", threshold=0.5),
+      ],
+      parallelism=1,
+  )
+
+  mock_eval_case = mocker.MagicMock(spec=EvalCase)
+  mock_eval_case.conversation = [invocation.model_copy(deep=True)]
+  mock_eval_case.conversation_scenario = None
+  mock_eval_case.live_persona_scenario = None
+  mock_eval_case.session_input = None
+  mock_eval_sets_manager.get_eval_case.return_value = mock_eval_case
+
+  _, result = await eval_service._evaluate_single_inference_result(
+      inference_result=inference_result, evaluate_config=evaluate_config
+  )
+
+  # Single metric: no batched call; falls back to per-metric evaluation.
+  assert FakeBatchableEvaluator.batch_call_count == 0
+  assert len(result.overall_eval_metric_results) == 1
+  assert (
+      result.overall_eval_metric_results[0].metric_name == "fake_batch_metric_a"
+  )
+
+
+def test_safety_and_multi_turn_metrics_share_one_batch_group(eval_service):
+  """Safety batches with the multi-turn metrics (single managed eval call)."""
+  metrics = [
+      EvalMetric(metric_name="multi_turn_task_success_v1", threshold=0.7),
+      EvalMetric(metric_name="multi_turn_trajectory_quality_v1", threshold=0.7),
+      EvalMetric(metric_name="safety_v1", threshold=0.8),
+  ]
+
+  batched_groups, standalone = eval_service._partition_metrics_for_batching(
+      metrics
+  )
+
+  # All three managed metrics fall into a single batch group; none standalone.
+  assert standalone == []
+  assert len(batched_groups) == 1
+  group = next(iter(batched_groups.values()))
+  group_names = {m.metric_name for m in group}
+  assert group_names == {
+      "multi_turn_task_success_v1",
+      "multi_turn_trajectory_quality_v1",
+      "safety_v1",
+  }
+
+
 @pytest.mark.asyncio
 async def test_perform_inference_success(
     eval_service,
@@ -247,6 +474,7 @@ async def test_perform_inference_with_case_ids(
       eval_case=eval_set.eval_cases[0],
       root_agent=dummy_agent,
       use_live=False,
+      live_persona_scenario=None,
       live_timeout_seconds=300,
   )
   eval_service._perform_inference_single_eval_item.assert_any_call(
@@ -255,6 +483,7 @@ async def test_perform_inference_with_case_ids(
       eval_case=eval_set.eval_cases[2],
       root_agent=dummy_agent,
       use_live=False,
+      live_persona_scenario=None,
       live_timeout_seconds=300,
   )
 
@@ -298,7 +527,54 @@ async def test_perform_inference_with_use_live(
       eval_case=eval_set.eval_cases[0],
       root_agent=dummy_agent,
       use_live=True,
+      live_persona_scenario=None,
       live_timeout_seconds=600,
+  )
+
+
+@pytest.mark.asyncio
+async def test_perform_inference_uses_persona_scenario_from_eval_case(
+    eval_service,
+    dummy_agent,
+    mock_eval_sets_manager,
+    mocker,
+):
+  """A persona saved on the eval case drives inference without a request scenario."""
+  from google.adk.evaluation.simulation.live_conversation_scenario import LiveConversationScenario
+  from google.adk.evaluation.simulation.persona import Persona
+
+  scenario = LiveConversationScenario(
+      persona=Persona(id="saved", character_prompt="c", goal="g"), max_turns=2
+  )
+  eval_set = EvalSet(
+      eval_set_id="test_eval_set",
+      eval_cases=[
+          EvalCase(eval_id="case1", live_persona_scenario=scenario),
+      ],
+  )
+  mock_eval_sets_manager.get_eval_set.return_value = eval_set
+
+  eval_service._perform_inference_single_eval_item = mocker.AsyncMock(
+      return_value=mocker.MagicMock()
+  )
+
+  inference_request = InferenceRequest(
+      app_name="test_app",
+      eval_set_id="test_eval_set",
+      inference_config=InferenceConfig(parallelism=1),
+  )
+
+  async for _ in eval_service.perform_inference(inference_request):
+    pass
+
+  eval_service._perform_inference_single_eval_item.assert_called_once_with(
+      app_name="test_app",
+      eval_set_id="test_eval_set",
+      eval_case=eval_set.eval_cases[0],
+      root_agent=dummy_agent,
+      use_live=False,
+      live_persona_scenario=scenario,
+      live_timeout_seconds=300,
   )
 
 
@@ -357,6 +633,7 @@ async def test_evaluate_success(
   mock_eval_case = mocker.MagicMock(spec=EvalCase)
   mock_eval_case.conversation = [invocation.model_copy(deep=True)]
   mock_eval_case.conversation_scenario = None
+  mock_eval_case.live_persona_scenario = None
   mock_eval_case.session_input = None
   mock_eval_sets_manager.get_eval_case.return_value = mock_eval_case
 
@@ -433,6 +710,7 @@ async def test_evaluate_single_inference_result(
       invocation.model_copy(deep=True),
   ]
   mock_eval_case.conversation_scenario = None
+  mock_eval_case.live_persona_scenario = None
   mock_eval_case.session_input = None
   mock_eval_sets_manager.get_eval_case.return_value = mock_eval_case
 
@@ -483,6 +761,7 @@ async def test_evaluate_single_inference_result_failed_without_inferences(
   mock_eval_case = mocker.MagicMock(spec=EvalCase)
   mock_eval_case.conversation = []
   mock_eval_case.conversation_scenario = None
+  mock_eval_case.live_persona_scenario = None
   mock_eval_case.session_input = None
   mock_eval_sets_manager.get_eval_case.return_value = mock_eval_case
 
@@ -896,6 +1175,7 @@ async def test_perform_inference_single_eval_item_live(
       eval_case=eval_case,
       root_agent=dummy_agent,
       use_live=True,
+      live_persona_scenario=None,
       live_timeout_seconds=600,
   )
 
@@ -935,6 +1215,7 @@ async def test_perform_inference_single_eval_item_non_live(
       eval_case=eval_case,
       root_agent=dummy_agent,
       use_live=False,
+      live_persona_scenario=None,
       live_timeout_seconds=300,
   )
 

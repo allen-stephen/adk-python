@@ -21,6 +21,24 @@ from .eval_metrics import MetricValueInfo
 from .eval_metrics import PrebuiltMetrics
 
 
+class LatencyV1MetricInfoProvider(MetricInfoProvider):
+  """Metric info provider for LatencyV1Evaluator."""
+
+  def get_metric_info(self) -> MetricInfo:
+    return MetricInfo(
+        metric_name=PrebuiltMetrics.RESPONSE_LATENCY_V1.value,
+        description=(
+            "This acoustic metric measures the agent's response latency in"
+            " seconds for live (voice) eval: the time between the user's turn"
+            " and the agent's first response. Lower values are better. It runs"
+            " locally with no cloud project."
+        ),
+        metric_value_info=MetricValueInfo(
+            interval=Interval(min_value=0.0, max_value=60.0)
+        ),
+    )
+
+
 class TrajectoryEvaluatorMetricInfoProvider(MetricInfoProvider):
   """Metric info provider for TrajectoryEvaluator."""
 

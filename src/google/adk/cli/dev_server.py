@@ -48,6 +48,7 @@ import yaml
 
 from . import agent_graph
 from ..errors.not_found_error import NotFoundError
+from ..evaluation._eval_sets_manager_utils import get_or_create_persona_eval_shell
 from ..evaluation.base_eval_service import InferenceConfig
 from ..evaluation.base_eval_service import InferenceRequest
 from ..evaluation.eval_case import EvalCase
@@ -59,6 +60,7 @@ from ..evaluation.eval_metrics import EvalStatus
 from ..evaluation.eval_metrics import MetricInfo
 from ..evaluation.eval_result import EvalSetResult
 from ..evaluation.eval_set import EvalSet
+from ..evaluation.simulation.live_conversation_scenario import LiveConversationScenario
 from .api_server import ApiServer
 from .utils import common
 from .utils import evals
@@ -98,6 +100,20 @@ class RunEvalRequest(common.BaseModel):
       ),
   )
   eval_metrics: list[EvalMetric]
+  use_live: bool = Field(
+      default=False,
+      description=(
+          "Whether to run inference using the Live API (bidirectional"
+          " streaming). Required for Live API models (e.g. gemini-*-live-*)."
+      ),
+  )
+  live_persona_scenario: Optional[LiveConversationScenario] = Field(
+      default=None,
+      description=(
+          "When set, run a persona-driven audio-to-audio live conversation: a"
+          " synthetic persona agent speaks with the agent under test."
+      ),
+  )
 
 
 class RunEvalResult(common.BaseModel):
@@ -128,6 +144,13 @@ class GetEventGraphResult(common.BaseModel):
 
 class CreateEvalSetRequest(common.BaseModel):
   eval_set: EvalSet
+
+
+class AddPersonaToEvalSetRequest(common.BaseModel):
+  """Request to save a persona as a re-runnable eval case in an eval set."""
+
+  eval_id: str
+  live_persona_scenario: LiveConversationScenario
 
 
 class ListEvalSetsResponse(common.BaseModel):
@@ -725,6 +748,24 @@ class DevServer(ApiServer):
             detail=str(ve),
         ) from ve
 
+    @app.delete(
+        "/dev/apps/{app_name}/eval-sets/{eval_set_id}",
+        tags=[TAG_EVALUATION],
+    )
+    # The hyphenated path is preferred; the underscore alias matches older
+    # clients that have not migrated yet.
+    @app.delete(
+        "/dev/apps/{app_name}/eval_sets/{eval_set_id}",
+        tags=[TAG_EVALUATION],
+    )
+    async def delete_eval_set(app_name: str, eval_set_id: str) -> None:
+      try:
+        self.eval_sets_manager.delete_eval_set(
+            app_name=app_name, eval_set_id=eval_set_id
+        )
+      except NotFoundError as nfe:
+        raise HTTPException(status_code=404, detail=str(nfe)) from nfe
+
     # TODO - remove after migration
     @deprecated(
         "Please use create_eval_set instead. This will be removed in future"
@@ -830,6 +871,27 @@ class DevServer(ApiServer):
 
       return ListEvalSetsResponse(eval_set_ids=eval_sets)
 
+    @app.get(
+        "/dev/apps/{app_name}/eval-sets/{eval_set_id}",
+        response_model_exclude_none=True,
+        tags=[TAG_EVALUATION],
+    )
+    # The hyphenated path is preferred; the underscore alias matches older
+    # clients that have not migrated yet.
+    @app.get(
+        "/dev/apps/{app_name}/eval_sets/{eval_set_id}",
+        response_model_exclude_none=True,
+        tags=[TAG_EVALUATION],
+    )
+    async def get_eval_set(app_name: str, eval_set_id: str) -> EvalSet:
+      """Returns a single eval set, including its eval cases."""
+      eval_set = self.eval_sets_manager.get_eval_set(app_name, eval_set_id)
+      if eval_set is None:
+        raise HTTPException(
+            status_code=404, detail=f"Eval set `{eval_set_id}` not found."
+        )
+      return eval_set
+
     @app.post(
         "/dev/apps/{app_name}/eval-sets/{eval_set_id}/add-session",
         response_model_exclude_none=True,
@@ -868,6 +930,27 @@ class DevServer(ApiServer):
           creation_timestamp=time.time(),
       )
 
+      try:
+        self.eval_sets_manager.add_eval_case(
+            app_name, eval_set_id, new_eval_case
+        )
+      except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve)) from ve
+
+    @app.post(
+        "/dev/apps/{app_name}/eval-sets/{eval_set_id}/add-persona",
+        response_model_exclude_none=True,
+        tags=[TAG_EVALUATION],
+    )
+    async def add_persona_to_eval_set(
+        app_name: str, eval_set_id: str, req: AddPersonaToEvalSetRequest
+    ) -> None:
+      """Saves a persona scenario as a re-runnable eval case in an eval set."""
+      new_eval_case = EvalCase(
+          eval_id=req.eval_id,
+          live_persona_scenario=req.live_persona_scenario,
+          creation_timestamp=time.time(),
+      )
       try:
         self.eval_sets_manager.add_eval_case(
             app_name, eval_set_id, new_eval_case
@@ -993,12 +1076,24 @@ class DevServer(ApiServer):
         from .cli_eval import _collect_eval_results
         from .cli_eval import _collect_inferences
 
-        eval_set = self.eval_sets_manager.get_eval_set(app_name, eval_set_id)
-
-        if not eval_set:
-          raise HTTPException(
-              status_code=400, detail=f"Eval set `{eval_set_id}` not found."
+        # A persona-driven live run is generated fresh from the persona and does
+        # not require a pre-authored eval set. Synthesize (or reuse) a minimal
+        # bookkeeping shell so results have a set/case to attach to, rather than
+        # forcing the caller to create one first.
+        if req.live_persona_scenario is not None:
+          eval_set_id, persona_eval_case_id = get_or_create_persona_eval_shell(
+              self.eval_sets_manager,
+              app_name=app_name,
+              persona=req.live_persona_scenario.persona,
           )
+          eval_case_ids = [persona_eval_case_id]
+        else:
+          eval_set = self.eval_sets_manager.get_eval_set(app_name, eval_set_id)
+          if not eval_set:
+            raise HTTPException(
+                status_code=400, detail=f"Eval set `{eval_set_id}` not found."
+            )
+          eval_case_ids = req.eval_case_ids or req.eval_ids
 
         agent_or_app = self.agent_loader.load_agent(app_name)
         root_agent = self._get_root_agent(agent_or_app)
@@ -1014,9 +1109,12 @@ class DevServer(ApiServer):
         )
         inference_request = InferenceRequest(
             app_name=app_name,
-            eval_set_id=eval_set.eval_set_id,
-            eval_case_ids=req.eval_case_ids or req.eval_ids,
-            inference_config=InferenceConfig(),
+            eval_set_id=eval_set_id,
+            eval_case_ids=eval_case_ids,
+            inference_config=InferenceConfig(
+                use_live=req.use_live or req.live_persona_scenario is not None,
+                live_persona_scenario=req.live_persona_scenario,
+            ),
         )
         inference_results = await _collect_inferences(
             inference_requests=[inference_request], eval_service=eval_service

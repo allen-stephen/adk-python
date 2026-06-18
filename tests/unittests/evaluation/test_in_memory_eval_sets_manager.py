@@ -80,6 +80,20 @@ def test_list_eval_sets(manager, app_name):
   assert "set2" in eval_sets
 
 
+def test_delete_eval_set(manager, app_name, eval_set_id):
+  manager.create_eval_set(app_name, eval_set_id)
+
+  manager.delete_eval_set(app_name, eval_set_id)
+
+  assert manager.get_eval_set(app_name, eval_set_id) is None
+
+
+def test_delete_eval_set_not_found(manager, app_name):
+  manager.create_eval_set(app_name, "existing_set")
+  with pytest.raises(NotFoundError):
+    manager.delete_eval_set(app_name, "nonexistent_set")
+
+
 def test_list_eval_sets_wrong_app(manager, app_name):
   manager.create_eval_set(app_name, "set1")
   eval_sets = manager.list_eval_sets("wrong_app")

@@ -146,6 +146,19 @@ class GcsEvalSetsManager(EvalSetsManager):
       ) from e
 
   @override
+  def delete_eval_set(self, app_name: str, eval_set_id: str):
+    """Deletes the EvalSet identified by app_name and eval_set_id.
+
+    Raises:
+      NotFoundError: If the eval set is not found.
+    """
+    # Validate the eval set exists (raises NotFoundError otherwise).
+    get_eval_set_from_app_and_id(self, app_name, eval_set_id)
+    eval_set_blob_name = self._get_eval_set_blob_name(app_name, eval_set_id)
+    logger.info("Deleting eval set blob `%s`", eval_set_blob_name)
+    self.bucket.blob(eval_set_blob_name).delete()
+
+  @override
   def get_eval_case(
       self, app_name: str, eval_set_id: str, eval_case_id: str
   ) -> Optional[EvalCase]:

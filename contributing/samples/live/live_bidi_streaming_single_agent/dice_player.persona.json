@@ -1,0 +1,11 @@
+{
+  "persona": {
+    "id": "dice_player",
+    "description": "A curious user who wants to play dice games",
+    "characterPrompt": "You are a curious, friendly person who loves dice games and wants to roll some dice and check if numbers are prime.",
+    "goal": "Roll a 20-sided die, then ask whether the result is a prime number.",
+    "voiceName": "Aoede",
+    "languageCode": "en-US"
+  },
+  "maxTurns": 6
+}

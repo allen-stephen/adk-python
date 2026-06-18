@@ -75,6 +75,16 @@ class InMemoryEvalSetsManager(EvalSetsManager):
     return list(self._eval_sets[app_name].keys())
 
   @override
+  def delete_eval_set(self, app_name: str, eval_set_id: str):
+    self._ensure_app_exists(app_name)
+    if eval_set_id not in self._eval_sets[app_name]:
+      raise NotFoundError(
+          f"EvalSet {eval_set_id} not found for app {app_name}."
+      )
+    del self._eval_sets[app_name][eval_set_id]
+    self._eval_cases[app_name].pop(eval_set_id, None)
+
+  @override
   def get_eval_case(
       self, app_name: str, eval_set_id: str, eval_case_id: str
   ) -> Optional[EvalCase]:

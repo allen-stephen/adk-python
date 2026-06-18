@@ -26,6 +26,7 @@ from pathlib import Path
 import sys
 import tempfile
 import textwrap
+from typing import TYPE_CHECKING
 
 import click
 from click.core import ParameterSource
@@ -41,10 +42,94 @@ from .cli import run_cli
 from .utils import envs
 from .utils import logs
 
+if TYPE_CHECKING:
+  from ..evaluation.eval_metrics import EvalMetric
+
 LOG_LEVELS = click.Choice(
     ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
     case_sensitive=False,
 )
+
+# Metrics that compare the agent's output against a golden/expected response.
+# A persona (live audio-to-audio) run synthesizes the conversation fresh and has
+# no golden reference, so these metrics cannot be scored and would hard-fail at
+# scoring time. They are filtered out (with a warning) for live runs.
+_REFERENCE_BASED_METRIC_NAMES = frozenset({
+    "response_match_score",
+    "response_evaluation_score",
+    "tool_trajectory_avg_score",
+    "final_response_match_v2",
+})
+
+# The managed (Gen AI Eval Service) multi-turn metrics offered for persona live
+# runs via --managed_metrics. These are reference-free and valid for live.
+_MANAGED_LIVE_METRIC_DEFAULTS = (
+    ("multi_turn_task_success_v1", 0.7),
+    ("multi_turn_trajectory_quality_v1", 0.7),
+    ("safety_v1", 0.8),
+)
+
+# Native-audio Live models typically respond in 2-5s, so use a realistic default
+# latency threshold. Kept in sync with the web UI's LOCAL_LIVE_METRICS.
+_LIVE_LATENCY_THRESHOLD_SECONDS = 5.0
+
+
+def _resolve_live_eval_metrics(
+    eval_metrics: list[EvalMetric],
+    *,
+    config_file_path: str | None,
+    managed_metrics: bool,
+) -> list[EvalMetric]:
+  """Returns the metrics to use for a persona (live) eval run.
+
+  A persona run has no golden references, so reference-based metrics do not
+  apply:
+
+  - When no config file was supplied, we default to the local latency metric and
+    add the managed multi-turn metrics only when `managed_metrics` is set.
+  - When a config file was supplied, we honor it but drop any reference-based
+    metrics (with a warning) so the run does not hard-fail at scoring time.
+
+  Args:
+    eval_metrics: Metrics resolved from the config (or default config).
+    config_file_path: The explicit eval config path, if any.
+    managed_metrics: Whether to add the managed multi-turn metrics (only used
+      when no config file is supplied).
+
+  Returns:
+    The metrics to run for the live persona eval.
+  """
+  from ..evaluation.eval_metrics import EvalMetric
+
+  if not config_file_path:
+    resolved = [
+        EvalMetric(
+            metric_name="response_latency_v1",
+            threshold=_LIVE_LATENCY_THRESHOLD_SECONDS,
+        )
+    ]
+    if managed_metrics:
+      resolved.extend(
+          EvalMetric(metric_name=name, threshold=threshold)
+          for name, threshold in _MANAGED_LIVE_METRIC_DEFAULTS
+      )
+    metric_names = ", ".join(m.metric_name for m in resolved)
+    print(f"Persona live run: using reference-free metrics [{metric_names}].")
+    return resolved
+
+  # A config file was supplied: honor it, but drop reference-based metrics that
+  # cannot be scored without a golden reference.
+  resolved = []
+  for metric in eval_metrics:
+    if metric.metric_name in _REFERENCE_BASED_METRIC_NAMES:
+      print(
+          f"Skipping metric '{metric.metric_name}' for the persona live run: it"
+          " requires a golden/expected response, which a live run does not"
+          " have."
+      )
+      continue
+    resolved.append(metric)
+  return resolved
 
 
 def _logging_options():
@@ -933,12 +1018,65 @@ def eval_options():
     default=False,
     help="Optional. Whether to print detailed results on console or not.",
 )
+@click.option(
+    "--use_live",
+    is_flag=True,
+    show_default=True,
+    default=False,
+    help=(
+        "Optional. Run inference using the Live API (bidirectional streaming)."
+        " Required for Live API models (e.g. gemini-*-live-*)."
+    ),
+)
+@click.option(
+    "--persona",
+    "persona_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help=(
+        "Optional. Path to a JSON file describing a persona for"
+        " audio-to-audio live eval. A synthetic persona agent speaks with the"
+        " agent under test (implies --use_live)."
+    ),
+)
+@click.option(
+    "--watch",
+    is_flag=True,
+    show_default=True,
+    default=False,
+    help=(
+        "Optional. With --persona, stream the live conversation to the console"
+        " as it unfolds."
+    ),
+)
+@click.option(
+    "--managed_metrics",
+    is_flag=True,
+    show_default=True,
+    default=False,
+    help=(
+        "Optional. With --persona, also score with the managed Gen AI Eval"
+        " Service multi-turn metrics (requires a GCP project; slower). By"
+        " default only the local latency metric is used."
+    ),
+)
+@click.option(
+    "--live_timeout_seconds",
+    type=int,
+    default=None,
+    help="Optional. Per-turn timeout in seconds when running with --use_live.",
+)
 @eval_options()
 def cli_eval(
     agent_module_file_path: str,
     eval_set_file_path_or_id: list[str],
     config_file_path: str,
     print_detailed_results: bool,
+    use_live: bool = False,
+    persona_path: str | None = None,
+    watch: bool = False,
+    managed_metrics: bool = False,
+    live_timeout_seconds: int | None = None,
     eval_storage_uri: str | None = None,
     log_level: str = "INFO",
 ):
@@ -1029,6 +1167,46 @@ def cli_eval(
   print(f"Using evaluation criteria: {eval_config}")
   eval_metrics = get_eval_metrics_from_config(eval_config)
 
+  live_persona_scenario = None
+  if persona_path:
+    from ..evaluation.simulation.live_conversation_scenario import LiveConversationScenario
+
+    with open(persona_path, "r") as persona_file:
+      live_persona_scenario = LiveConversationScenario.model_validate_json(
+          persona_file.read()
+      )
+    use_live = True
+
+    # A persona run has no golden references, so reference-based metrics do not
+    # apply. Resolve the valid live metric set (defaulting to local latency, with
+    # managed multi-turn metrics opt-in, and filtering reference-based metrics
+    # out of any supplied config).
+    eval_metrics = _resolve_live_eval_metrics(
+        eval_metrics,
+        config_file_path=config_file_path,
+        managed_metrics=managed_metrics,
+    )
+
+  inference_config_kwargs = {
+      "use_live": use_live,
+      "live_persona_scenario": live_persona_scenario,
+  }
+  if live_timeout_seconds is not None:
+    inference_config_kwargs["live_timeout_seconds"] = live_timeout_seconds
+  inference_config = InferenceConfig(**inference_config_kwargs)
+
+  if watch and live_persona_scenario is not None:
+    persona = live_persona_scenario.persona
+    click.secho(
+        f"\n🎙  Live persona eval: '{persona.id}' (voice: {persona.voice_name})"
+        f" speaking with the agent under test.\n   Goal: {persona.goal}\n",
+        fg="cyan",
+    )
+  elif watch:
+    click.secho(
+        "--watch has no effect without --persona; ignoring.", fg="yellow"
+    )
+
   root_agent = get_root_agent(agent_module_file_path)
   app_name = os.path.basename(agent_module_file_path)
   agents_dir = os.path.dirname(agent_module_file_path)
@@ -1087,7 +1265,7 @@ def cli_eval(
               app_name=app_name,
               eval_set_id=eval_set.eval_set_id,
               eval_case_ids=eval_case_ids,
-              inference_config=InferenceConfig(),
+              inference_config=inference_config,
           )
       )
   else:
@@ -1104,9 +1282,30 @@ def cli_eval(
               app_name=app_name,
               eval_set_id=eval_set_id_key,
               eval_case_ids=eval_case_ids,
-              inference_config=InferenceConfig(),
+              inference_config=inference_config,
           )
       )
+
+  # A persona-driven live run does not need a pre-authored eval set: the
+  # conversation is generated fresh from the persona. If no eval set was
+  # provided, synthesize a single-case in-memory set so inference can run.
+  if live_persona_scenario is not None and not inference_requests:
+    from ..evaluation._eval_sets_manager_utils import get_or_create_persona_eval_shell
+    from ..evaluation.in_memory_eval_sets_manager import InMemoryEvalSetsManager
+
+    eval_sets_manager = InMemoryEvalSetsManager()
+    synthetic_set_id, _ = get_or_create_persona_eval_shell(
+        eval_sets_manager,
+        app_name=app_name,
+        persona=live_persona_scenario.persona,
+    )
+    inference_requests.append(
+        InferenceRequest(
+            app_name=app_name,
+            eval_set_id=synthetic_set_id,
+            inference_config=inference_config,
+        )
+    )
 
   user_simulator_provider = UserSimulatorProvider(
       user_simulator_config=eval_config.user_simulator_config

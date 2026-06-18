@@ -262,6 +262,19 @@ class LocalEvalSetsManager(EvalSetsManager):
       ) from e
 
   @override
+  def delete_eval_set(self, app_name: str, eval_set_id: str):
+    """Deletes the EvalSet identified by app_name and eval_set_id.
+
+    Raises:
+      NotFoundError: If the eval set is not found.
+    """
+    # Validate the eval set exists (raises NotFoundError otherwise).
+    get_eval_set_from_app_and_id(self, app_name, eval_set_id)
+    eval_set_file_path = self._get_eval_set_file_path(app_name, eval_set_id)
+    logger.info("Deleting eval set file `%s`", eval_set_file_path)
+    os.remove(eval_set_file_path)
+
+  @override
   def get_eval_case(
       self, app_name: str, eval_set_id: str, eval_case_id: str
   ) -> Optional[EvalCase]:

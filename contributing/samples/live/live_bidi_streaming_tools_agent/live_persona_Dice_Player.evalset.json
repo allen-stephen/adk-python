@@ -1,0 +1,27 @@
+{
+  "eval_set_id": "live_persona_Dice_Player",
+  "name": "live_persona_Dice_Player",
+  "eval_cases": [
+    {
+      "eval_id": "Dice_Player_persona",
+      "live_persona_scenario": {
+        "persona": {
+          "id": "Dice_Player",
+          "description": "Dice Player",
+          "character_prompt": "You are a curious, friendly person who loves dice games and wants to roll some dice and check if numbers are prime.",
+          "goal": "Roll a 20-sided die, then ask whether the result is a prime number."
+        },
+        "max_turns": 6
+      },
+      "creation_timestamp": 1781737124.92168
+    },
+    {
+      "eval_id": "Dice_Player_conversation",
+      "conversation_scenario": {
+        "starting_prompt": "Roll a 20-sided die, then ask whether the result is a prime number.",
+        "conversation_plan": "You are a curious, friendly person who loves dice games and wants to roll some dice and check if numbers are prime."
+      }
+    }
+  ],
+  "creation_timestamp": 1781737124.913468
+}

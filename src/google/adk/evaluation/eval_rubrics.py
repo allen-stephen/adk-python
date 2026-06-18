@@ -80,3 +80,12 @@ class RubricScore(EvalBaseModel):
           " might not have happened."
       ),
   )
+
+  verdict: Optional[bool] = Field(
+      default=None,
+      description=(
+          "Whether the rubric passed (True) or failed (False). Optional; some"
+          " metrics report only a numeric score rather than a pass/fail"
+          " verdict."
+      ),
+  )

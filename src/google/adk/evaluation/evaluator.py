@@ -38,6 +38,8 @@ class PerInvocationResult(BaseModel):
   score: Optional[float] = None
   eval_status: EvalStatus = EvalStatus.NOT_EVALUATED
   rubric_scores: Optional[list[RubricScore]] = None
+  explanation: Optional[str] = None
+  """Free-text explanation of the result, when the metric provides one."""
 
 
 class EvaluationResult(BaseModel):
@@ -52,6 +54,9 @@ class EvaluationResult(BaseModel):
 
   overall_rubric_scores: Optional[list[RubricScore]] = None
   """Overall rubric, based on each invocation."""
+
+  overall_explanation: Optional[str] = None
+  """Free-text explanation of the overall result, when one is provided."""
 
 
 class Evaluator(ABC):
@@ -76,5 +81,52 @@ class Evaluator(ABC):
         invocation is the same.
       conversation_scenario: An optional conversation scenario for multi-turn
         conversations.
+    """
+    raise NotImplementedError()
+
+
+class BatchableEvaluator(Evaluator):
+  """An evaluator whose metric can be computed alongside others in one call.
+
+  Several ADK metrics are backed by the same external eval service and share an
+  identical request payload (the conversation/turn data), differing only by the
+  metric they request. Such metrics can be computed together in a single
+  service call instead of one call each, which is a large latency win when many
+  metrics are run (the common case for live/voice eval).
+
+  Evaluators that opt in expose a `batch_group_key` (metrics sharing a key can
+  be sent together) and a `batch_spec` (the per-metric handle + threshold). The
+  actual batched call is delegated to `evaluate_batch`, which a single member of
+  the group performs on behalf of the whole group.
+  """
+
+  def get_batch_group_key(self) -> Optional[str]:
+    """Returns a key identifying metrics that can be batched together.
+
+    Metrics that return the same non-None key can be computed in one call.
+    Returning None opts this metric out of batching (it will run on its own).
+    """
+    return None
+
+  def get_batch_spec(self) -> object:
+    """Returns the per-metric spec (handle + threshold) for batched execution."""
+    raise NotImplementedError()
+
+  def evaluate_batch(
+      self,
+      batch_specs: list[object],
+      actual_invocations: list[Invocation],
+      expected_invocations: Optional[list[Invocation]] = None,
+  ) -> dict[str, EvaluationResult]:
+    """Computes all metrics in `batch_specs` in a single service call.
+
+    Args:
+      batch_specs: The specs (from `get_batch_spec`) of every metric in the
+        group, including this evaluator's own.
+      actual_invocations: Invocations from the agent under test.
+      expected_invocations: Optional golden invocations.
+
+    Returns:
+      A mapping from ADK metric name to its EvaluationResult.
     """
     raise NotImplementedError()

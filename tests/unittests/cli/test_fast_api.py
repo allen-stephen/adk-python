@@ -1911,6 +1911,30 @@ def test_get_eval_set_result_not_found(test_app):
   assert response.status_code == 404
 
 
+@pytest.mark.parametrize("path_segment", ["eval-sets", "eval_sets"])
+def test_get_eval_set_returns_eval_set(
+    builder_test_client, mock_eval_sets_manager, path_segment
+):
+  """GET on a single eval set returns it (both hyphen and underscore paths)."""
+  mock_eval_sets_manager.create_eval_set(
+      app_name="test_app", eval_set_id="my_set"
+  )
+
+  url = f"/dev/apps/test_app/{path_segment}/my_set"
+  response = builder_test_client.get(url)
+
+  assert response.status_code == 200
+  data = response.json()
+  assert data["eval_set_id"] == "my_set"
+
+
+def test_get_eval_set_not_found(builder_test_client):
+  """GET on a missing eval set returns 404 (previously a 405)."""
+  url = "/dev/apps/test_app/eval-sets/does_not_exist"
+  response = builder_test_client.get(url)
+  assert response.status_code == 404
+
+
 def test_list_metrics_info(builder_test_client):
   """Test listing metrics info."""
   url = "/dev/apps/test_app/metrics-info"

@@ -51,6 +51,14 @@ class EvalSetsManager(ABC):
     """
 
   @abstractmethod
+  def delete_eval_set(self, app_name: str, eval_set_id: str):
+    """Deletes the EvalSet identified by app_name and eval_set_id.
+
+    Raises:
+      NotFoundError: If the eval set is not found.
+    """
+
+  @abstractmethod
   def get_eval_case(
       self, app_name: str, eval_set_id: str, eval_case_id: str
   ) -> Optional[EvalCase]:

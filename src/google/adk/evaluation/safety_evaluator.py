@@ -21,12 +21,14 @@ from typing_extensions import override
 from .eval_case import ConversationScenario
 from .eval_case import Invocation
 from .eval_metrics import EvalMetric
+from .evaluator import BatchableEvaluator
 from .evaluator import EvaluationResult
-from .evaluator import Evaluator
+from .vertex_ai_eval_facade import _BatchMetricSpec
+from .vertex_ai_eval_facade import _MultiTurnVertexiAiEvalFacade
 from .vertex_ai_eval_facade import _SingleTurnVertexAiEvalFacade
 
 
-class SafetyEvaluatorV1(Evaluator):
+class SafetyEvaluatorV1(BatchableEvaluator):
   """Evaluates safety (harmlessness) of an Agent's Response.
 
   The class delegates the responsibility to Vertex Gen AI Eval SDK. The V1
@@ -58,4 +60,43 @@ class SafetyEvaluatorV1(Evaluator):
         metric_name=vertexai.types.PrebuiltMetric.SAFETY,
     ).evaluate_invocations(
         actual_invocations, expected_invocations, conversation_scenario
+    )
+
+  @override
+  def get_batch_group_key(self) -> str:
+    # Safety is a pointwise metric (reads the final turn's prompt/response), but
+    # the multi-turn facade also populates those fields on its EvalCase. Joining
+    # the `vertex_multi_turn` group lets safety be computed in the SAME single
+    # eval-service call as the multi-turn metrics, instead of a separate per-turn
+    # call. (When run alone, the standalone path below still uses the single-turn
+    # facade.)
+    return "vertex_multi_turn"
+
+  @override
+  def get_batch_spec(self) -> _BatchMetricSpec:
+    from ..dependencies.vertexai import vertexai
+
+    return _BatchMetricSpec(
+        adk_metric_name=self._eval_metric.metric_name,
+        metric=vertexai.types.PrebuiltMetric.SAFETY,
+        threshold=self._eval_metric.threshold,
+    )
+
+  @override
+  def evaluate_batch(
+      self,
+      batch_specs: list[_BatchMetricSpec],
+      actual_invocations: list[Invocation],
+      expected_invocations: Optional[list[Invocation]] = None,
+  ) -> dict[str, EvaluationResult]:
+    from ..dependencies.vertexai import vertexai
+
+    # Route through the multi-turn facade so safety shares the single multi-turn
+    # eval-service call. The multi-turn EvalCase carries the final turn's
+    # prompt/response, which is what the safety metric scores.
+    return _MultiTurnVertexiAiEvalFacade(
+        threshold=self._eval_metric.threshold,
+        metric_name=vertexai.types.PrebuiltMetric.SAFETY,
+    ).evaluate_invocations_for_metrics(
+        batch_specs, actual_invocations, expected_invocations
     )

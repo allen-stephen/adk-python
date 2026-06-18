@@ -72,6 +72,91 @@ class TestConvertEventsToEvalInvocation:
     assert invocation.final_response.parts[0].text == "Hi there!"
     assert len(invocation.intermediate_data.invocation_events) == 0
 
+  def test_convert_live_turn_uses_transcriptions(self):
+    """A live turn captures user/agent text from audio transcriptions.
+
+    Live (voice) sessions stream audio with the text carried in
+    input/output transcriptions rather than in event content. The user turn
+    has no content at all, so the conversion must fall back to transcriptions.
+    """
+    user_event = Event(
+        author="user",
+        content=None,
+        invocation_id="inv1",
+        input_transcription=types.Transcription(text="Hello there"),
+    )
+    agent_event = Event(
+        author="agent",
+        content=None,
+        invocation_id="inv1",
+        output_transcription=types.Transcription(text="Hi, how can I help?"),
+    )
+
+    invocations = EvaluationGenerator.convert_events_to_eval_invocations(
+        [user_event, agent_event]
+    )
+
+    assert len(invocations) == 1
+    invocation = invocations[0]
+    assert invocation.user_content.parts[0].text == "Hello there"
+    assert invocation.final_response.parts[0].text == "Hi, how can I help?"
+
+  def test_convert_live_multi_turn_shared_invocation_id(self):
+    """A live session's multiple turns under one invocation id become separate invocations.
+
+    Live (voice) sessions share a single invocation id across the whole
+    bidirectional conversation. Each user turn must still become its own
+    Invocation rather than being collapsed into one.
+    """
+    events = [
+        Event(
+            author="user",
+            content=None,
+            invocation_id="live1",
+            input_transcription=types.Transcription(text="Hi there"),
+        ),
+        Event(
+            author="agent",
+            content=None,
+            invocation_id="live1",
+            output_transcription=types.Transcription(text="Hello!"),
+        ),
+        Event(
+            author="user",
+            content=None,
+            invocation_id="live1",
+            input_transcription=types.Transcription(text="Roll a die"),
+        ),
+        Event(
+            author="agent",
+            content=None,
+            invocation_id="live1",
+            output_transcription=types.Transcription(text="You rolled a 5."),
+        ),
+        Event(
+            author="user",
+            content=None,
+            invocation_id="live1",
+            input_transcription=types.Transcription(text="Thanks"),
+        ),
+        Event(
+            author="agent",
+            content=None,
+            invocation_id="live1",
+            output_transcription=types.Transcription(text="You're welcome!"),
+        ),
+    ]
+
+    invocations = EvaluationGenerator.convert_events_to_eval_invocations(events)
+
+    assert len(invocations) == 3
+    assert invocations[0].user_content.parts[0].text == "Hi there"
+    assert invocations[0].final_response.parts[0].text == "Hello!"
+    assert invocations[1].user_content.parts[0].text == "Roll a die"
+    assert invocations[1].final_response.parts[0].text == "You rolled a 5."
+    assert invocations[2].user_content.parts[0].text == "Thanks"
+    assert invocations[2].final_response.parts[0].text == "You're welcome!"
+
   def test_convert_single_turn_tool_call(
       self,
   ):

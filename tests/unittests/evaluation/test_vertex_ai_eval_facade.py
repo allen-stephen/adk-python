@@ -26,7 +26,9 @@ from google.adk.evaluation.eval_case import Invocation
 from google.adk.evaluation.eval_case import InvocationEvent
 from google.adk.evaluation.eval_case import InvocationEvents
 from google.adk.evaluation.evaluator import EvalStatus
+from google.adk.evaluation.vertex_ai_eval_facade import _BatchMetricSpec
 from google.adk.evaluation.vertex_ai_eval_facade import _MultiTurnVertexiAiEvalFacade
+from google.adk.evaluation.vertex_ai_eval_facade import _resolve_metric_spec_name
 from google.adk.evaluation.vertex_ai_eval_facade import _SingleTurnVertexAiEvalFacade
 from google.adk.evaluation.vertex_ai_eval_facade import _VertexAiEvalFacade
 from google.genai import types as genai_types
@@ -592,3 +594,361 @@ class TestMultiTurnVertexAiEvalFacade:
     assert agent_data.turns[0].turn_id == "inv1"
     assert agent_data.turns[1].turn_id == "inv2"
     assert len(agent_data.turns[1].events) == 3  # user, intermediate, agent
+
+
+class TestResolveMetricSpecName:
+  """Tests for resolving Vertex metric handles to their result-key spec name."""
+
+  def test_resolves_rubric_metric_to_spec_name(self):
+    assert (
+        _resolve_metric_spec_name(
+            vertexai_types.RubricMetric.MULTI_TURN_TASK_SUCCESS
+        )
+        == "multi_turn_task_success_v1"
+    )
+
+  def test_resolves_prebuilt_metric_to_spec_name(self):
+    assert (
+        _resolve_metric_spec_name(vertexai_types.PrebuiltMetric.SAFETY)
+        == "safety_v1"
+    )
+
+  def test_resolves_plain_string(self):
+    assert _resolve_metric_spec_name("response_match_score") == (
+        "response_match_score"
+    )
+
+
+class TestBatchedEvaluation:
+  """Tests for computing multiple metrics in a single eval-service call."""
+
+  def test_multi_turn_batch_single_call_maps_results_by_metric(self, mocker):
+    """Multi-turn metrics share one call; results keyed by spec name."""
+    mock_perform_eval = mocker.patch(
+        "google.adk.evaluation.vertex_ai_eval_facade._VertexAiEvalFacade._perform_eval"
+    )
+    actual_invocations = [
+        Invocation(
+            invocation_id="inv1",
+            user_content=genai_types.Content(
+                parts=[genai_types.Part(text="q1")]
+            ),
+            intermediate_data=InvocationEvents(invocation_events=[]),
+            final_response=genai_types.Content(
+                parts=[genai_types.Part(text="r1")]
+            ),
+        ),
+        Invocation(
+            invocation_id="inv2",
+            user_content=genai_types.Content(
+                parts=[genai_types.Part(text="q2")]
+            ),
+            intermediate_data=InvocationEvents(invocation_events=[]),
+            final_response=genai_types.Content(
+                parts=[genai_types.Part(text="r2")]
+            ),
+        ),
+    ]
+    # A single batched call returns one summary entry per metric, keyed by spec
+    # name.
+    mock_perform_eval.return_value = vertexai_types.EvaluationResult(
+        summary_metrics=[
+            vertexai_types.AggregatedMetricResult(
+                metric_name="multi_turn_task_success_v1", mean_score=0.9
+            ),
+            vertexai_types.AggregatedMetricResult(
+                metric_name="multi_turn_trajectory_quality_v1", mean_score=0.4
+            ),
+        ],
+        eval_case_results=[],
+    )
+
+    evaluator = _MultiTurnVertexiAiEvalFacade(
+        threshold=0.8,
+        metric_name=vertexai_types.RubricMetric.MULTI_TURN_TASK_SUCCESS,
+    )
+    specs = [
+        _BatchMetricSpec(
+            adk_metric_name="multi_turn_task_success_v1",
+            metric=vertexai_types.RubricMetric.MULTI_TURN_TASK_SUCCESS,
+            threshold=0.8,
+        ),
+        _BatchMetricSpec(
+            adk_metric_name="multi_turn_trajectory_quality_v1",
+            metric=vertexai_types.RubricMetric.MULTI_TURN_TRAJECTORY_QUALITY,
+            threshold=0.8,
+        ),
+    ]
+
+    results = evaluator.evaluate_invocations_for_metrics(
+        specs, actual_invocations
+    )
+
+    # Only one service call for both metrics.
+    mock_perform_eval.assert_called_once()
+    _, mock_kwargs = mock_perform_eval.call_args
+    assert len(mock_kwargs["metrics"]) == 2
+
+    # The EvalCase carries agent_data (for multi-turn metrics) AND the final
+    # turn's prompt/response (so pointwise metrics like safety can also score).
+    dataset = mock_kwargs["dataset"]
+    eval_case = dataset.eval_cases[0]
+    assert eval_case.agent_data is not None
+    assert eval_case.prompt.parts[0].text == "q2"
+    assert eval_case.responses[0].response.parts[0].text == "r2"
+
+    task_success = results["multi_turn_task_success_v1"]
+    assert task_success.overall_score == 0.9
+    assert task_success.overall_eval_status == EvalStatus.PASSED
+    # Last turn scored; earlier turn NOT_EVALUATED for multi-turn metrics.
+    assert len(task_success.per_invocation_results) == 2
+    assert (
+        task_success.per_invocation_results[0].eval_status
+        == EvalStatus.NOT_EVALUATED
+    )
+    assert (
+        task_success.per_invocation_results[1].eval_status == EvalStatus.PASSED
+    )
+
+    trajectory = results["multi_turn_trajectory_quality_v1"]
+    assert trajectory.overall_score == 0.4
+    assert trajectory.overall_eval_status == EvalStatus.FAILED
+
+  def test_multi_turn_batch_includes_safety_in_one_call(self, mocker):
+    """Safety (pointwise) is computed in the same multi-turn call as the agent metrics."""
+    mock_perform_eval = mocker.patch(
+        "google.adk.evaluation.vertex_ai_eval_facade._VertexAiEvalFacade._perform_eval"
+    )
+    actual_invocations = [
+        Invocation(
+            invocation_id="inv1",
+            user_content=genai_types.Content(
+                parts=[genai_types.Part(text="q1")]
+            ),
+            intermediate_data=InvocationEvents(invocation_events=[]),
+            final_response=genai_types.Content(
+                parts=[genai_types.Part(text="r1")]
+            ),
+        ),
+        Invocation(
+            invocation_id="inv2",
+            user_content=genai_types.Content(
+                parts=[genai_types.Part(text="q2")]
+            ),
+            intermediate_data=InvocationEvents(invocation_events=[]),
+            final_response=genai_types.Content(
+                parts=[genai_types.Part(text="r2")]
+            ),
+        ),
+    ]
+    safety_spec_name = _resolve_metric_spec_name(
+        vertexai_types.PrebuiltMetric.SAFETY
+    )
+    mock_perform_eval.return_value = vertexai_types.EvaluationResult(
+        summary_metrics=[
+            vertexai_types.AggregatedMetricResult(
+                metric_name="multi_turn_task_success_v1", mean_score=0.9
+            ),
+            vertexai_types.AggregatedMetricResult(
+                metric_name=safety_spec_name, mean_score=0.95
+            ),
+        ],
+        eval_case_results=[],
+    )
+
+    evaluator = _MultiTurnVertexiAiEvalFacade(
+        threshold=0.8,
+        metric_name=vertexai_types.RubricMetric.MULTI_TURN_TASK_SUCCESS,
+    )
+    specs = [
+        _BatchMetricSpec(
+            adk_metric_name="multi_turn_task_success_v1",
+            metric=vertexai_types.RubricMetric.MULTI_TURN_TASK_SUCCESS,
+            threshold=0.8,
+        ),
+        _BatchMetricSpec(
+            adk_metric_name="safety_v1",
+            metric=vertexai_types.PrebuiltMetric.SAFETY,
+            threshold=0.8,
+        ),
+    ]
+
+    results = evaluator.evaluate_invocations_for_metrics(
+        specs, actual_invocations
+    )
+
+    # One call for both the multi-turn metric and safety.
+    mock_perform_eval.assert_called_once()
+    _, mock_kwargs = mock_perform_eval.call_args
+    assert len(mock_kwargs["metrics"]) == 2
+
+    assert results["multi_turn_task_success_v1"].overall_score == 0.9
+    safety = results["safety_v1"]
+    assert safety.overall_score == 0.95
+    assert safety.overall_eval_status == EvalStatus.PASSED
+
+  def test_multi_turn_batch_extracts_rubric_verdicts_and_explanation(
+      self, mocker
+  ):
+    """Rubric verdicts + explanation are surfaced from per-case results."""
+    mock_perform_eval = mocker.patch(
+        "google.adk.evaluation.vertex_ai_eval_facade._VertexAiEvalFacade._perform_eval"
+    )
+    actual_invocations = [
+        Invocation(
+            invocation_id="inv1",
+            user_content=genai_types.Content(
+                parts=[genai_types.Part(text="q1")]
+            ),
+            intermediate_data=InvocationEvents(invocation_events=[]),
+            final_response=genai_types.Content(
+                parts=[genai_types.Part(text="r1")]
+            ),
+        ),
+    ]
+    # The detailed per-case results carry rubric verdicts + an explanation.
+    metric_result = vertexai_types.EvalCaseMetricResult(
+        metric_name="multi_turn_trajectory_quality_v1",
+        score=0.4,
+        explanation="The agent skipped a required step.",
+        rubric_verdicts=[
+            vertexai_types.evals.RubricVerdict(
+                evaluated_rubric=vertexai_types.evals.Rubric(rubric_id="rb-1"),
+                verdict=False,
+                reasoning="Did not confirm the order.",
+            ),
+            vertexai_types.evals.RubricVerdict(
+                evaluated_rubric=vertexai_types.evals.Rubric(rubric_id="rb-2"),
+                verdict=True,
+                reasoning="Used the correct tool.",
+            ),
+        ],
+    )
+    mock_perform_eval.return_value = vertexai_types.EvaluationResult(
+        summary_metrics=[
+            vertexai_types.AggregatedMetricResult(
+                metric_name="multi_turn_trajectory_quality_v1", mean_score=0.4
+            ),
+        ],
+        eval_case_results=[
+            vertexai_types.EvalCaseResult(
+                eval_case_index=0,
+                response_candidate_results=[
+                    vertexai_types.ResponseCandidateResult(
+                        response_index=0,
+                        metric_results={
+                            "multi_turn_trajectory_quality_v1": metric_result
+                        },
+                    )
+                ],
+            )
+        ],
+    )
+
+    evaluator = _MultiTurnVertexiAiEvalFacade(
+        threshold=0.8,
+        metric_name=vertexai_types.RubricMetric.MULTI_TURN_TRAJECTORY_QUALITY,
+    )
+    specs = [
+        _BatchMetricSpec(
+            adk_metric_name="multi_turn_trajectory_quality_v1",
+            metric=vertexai_types.RubricMetric.MULTI_TURN_TRAJECTORY_QUALITY,
+            threshold=0.8,
+        ),
+    ]
+
+    results = evaluator.evaluate_invocations_for_metrics(
+        specs, actual_invocations
+    )
+
+    result = results["multi_turn_trajectory_quality_v1"]
+    assert result.overall_explanation == "The agent skipped a required step."
+    assert result.overall_rubric_scores is not None
+    assert len(result.overall_rubric_scores) == 2
+    by_id = {r.rubric_id: r for r in result.overall_rubric_scores}
+    assert by_id["rb-1"].verdict is False
+    assert by_id["rb-1"].rationale == "Did not confirm the order."
+    assert by_id["rb-1"].score == 0.0
+    assert by_id["rb-2"].verdict is True
+    assert by_id["rb-2"].score == 1.0
+    # The reasoning is also attached to the scored (last) per-invocation result.
+    last = result.per_invocation_results[-1]
+    assert last.rubric_scores is not None
+    assert last.explanation == "The agent skipped a required step."
+
+  def test_single_turn_batch_one_call_per_invocation(self, mocker):
+    """Single-turn metrics batch per invocation: one call per turn, all metrics."""
+    mocker.patch("google.adk.dependencies.vertexai.vertexai.Client")
+    mock_perform_eval = mocker.patch(
+        "google.adk.evaluation.vertex_ai_eval_facade._VertexAiEvalFacade._perform_eval"
+    )
+    actual_invocations = [
+        Invocation(
+            user_content=genai_types.Content(
+                parts=[genai_types.Part(text="q1")]
+            ),
+            final_response=genai_types.Content(
+                parts=[genai_types.Part(text="r1")]
+            ),
+        ),
+        Invocation(
+            user_content=genai_types.Content(
+                parts=[genai_types.Part(text="q2")]
+            ),
+            final_response=genai_types.Content(
+                parts=[genai_types.Part(text="r2")]
+            ),
+        ),
+    ]
+    safety_spec_name = _resolve_metric_spec_name(
+        vertexai_types.PrebuiltMetric.SAFETY
+    )
+    coherence_spec_name = _resolve_metric_spec_name(
+        vertexai_types.PrebuiltMetric.COHERENCE
+    )
+    mock_perform_eval.return_value = vertexai_types.EvaluationResult(
+        summary_metrics=[
+            vertexai_types.AggregatedMetricResult(
+                metric_name=safety_spec_name, mean_score=0.95
+            ),
+            vertexai_types.AggregatedMetricResult(
+                metric_name=coherence_spec_name, mean_score=0.6
+            ),
+        ],
+        eval_case_results=[],
+    )
+
+    evaluator = _SingleTurnVertexAiEvalFacade(
+        threshold=0.8, metric_name=vertexai_types.PrebuiltMetric.SAFETY
+    )
+    specs = [
+        _BatchMetricSpec(
+            adk_metric_name="safety_v1",
+            metric=vertexai_types.PrebuiltMetric.SAFETY,
+            threshold=0.8,
+        ),
+        _BatchMetricSpec(
+            adk_metric_name="coherence",
+            metric=vertexai_types.PrebuiltMetric.COHERENCE,
+            threshold=0.8,
+        ),
+    ]
+
+    results = evaluator.evaluate_invocations_for_metrics(
+        specs, actual_invocations
+    )
+
+    # One call per invocation (2), each requesting both metrics, instead of
+    # 2 invocations x 2 metrics = 4 calls.
+    assert mock_perform_eval.call_count == 2
+    _, mock_kwargs = mock_perform_eval.call_args
+    assert len(mock_kwargs["metrics"]) == 2
+
+    safety = results["safety_v1"]
+    assert safety.overall_score == 0.95
+    assert safety.overall_eval_status == EvalStatus.PASSED
+    assert len(safety.per_invocation_results) == 2
+
+    coherence = results["coherence"]
+    assert coherence.overall_score == 0.6
+    assert coherence.overall_eval_status == EvalStatus.FAILED

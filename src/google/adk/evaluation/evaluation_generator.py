@@ -386,7 +386,13 @@ class EvaluationGenerator:
       live_timeout_seconds: int,
       agent_name: str = _DEFAULT_AUTHOR,
   ) -> AsyncGenerator[Event, None]:
-    """Generates inferences for a single user invocation in live mode."""
+    """Generates inferences for a single user invocation in live mode.
+
+    The simulated user turn is injected as text via `send_content`; the agent
+    responds with audio that is captured back as transcription. For true
+    audio-to-audio persona evaluation, see
+    `simulation.persona_live_conversation.PersonaLiveConversationRunner`.
+    """
     yield Event(
         content=user_message,
         author=_USER_AUTHOR,
@@ -626,10 +632,6 @@ class EvaluationGenerator:
 
     invocations = []
     for invocation_id, events in events_by_invocation_id.items():
-      final_response = None
-      final_event: Optional[Event] = None
-      user_content = Content(parts=[])
-      invocation_timestamp = 0
       app_details = None
       if (
           app_details_per_invocation
@@ -637,54 +639,120 @@ class EvaluationGenerator:
       ):
         app_details = app_details_per_invocation[invocation_id]
 
-      events_to_add = []
-
-      for event in events:
-        current_author = (event.author or _DEFAULT_AUTHOR).lower()
-
-        if current_author == _USER_AUTHOR:
-          # If the author is the user, then we just identify it and move on
-          # to the next event.
-          user_content = event.content
-          invocation_timestamp = event.timestamp
-          continue
-
-        if event.content and event.content.parts:
-          if event.is_final_response():
-            final_response = event.content
-            final_event = event
-
-          for p in event.content.parts:
-            if (
-                p.function_call
-                or p.function_response
-                or p.text
-                or p.inline_data
-            ):
-              events_to_add.append(event)
-              break
-
-      invocation_events = [
-          InvocationEvent(author=e.author, content=e.content)
-          for e in events_to_add
-          if final_event is None
-          or e is not final_event
-          or e.get_function_calls()
-      ]
-      invocations.append(
-          Invocation(
-              invocation_id=invocation_id,
-              user_content=user_content,
-              final_response=final_response,
-              intermediate_data=InvocationEvents(
-                  invocation_events=invocation_events
-              ),
-              creation_timestamp=invocation_timestamp,
-              app_details=app_details,
-          )
-      )
+      # A single invocation id can carry multiple user turns. This happens for
+      # live (voice) sessions, where the entire bidirectional conversation
+      # shares one invocation id. Segment the events into one turn per user
+      # message so each user/agent exchange becomes its own Invocation.
+      for turn_events in EvaluationGenerator._segment_events_into_turns(events):
+        invocations.append(
+            EvaluationGenerator._build_invocation_from_turn(
+                invocation_id=invocation_id,
+                events=turn_events,
+                app_details=app_details,
+            )
+        )
 
     return invocations
+
+  @staticmethod
+  def _segment_events_into_turns(
+      events: list[Event],
+  ) -> list[list[Event]]:
+    """Splits an invocation's events into one segment per user turn.
+
+    Each segment begins at a user event and includes the agent events that
+    follow it, up to the next user event. Any agent events that precede the
+    first user event are attached to that first turn so nothing is dropped.
+    """
+    turns: list[list[Event]] = []
+    current: list[Event] = []
+    seen_user = False
+
+    for event in events:
+      is_user = (event.author or _DEFAULT_AUTHOR).lower() == _USER_AUTHOR
+      if is_user and seen_user:
+        turns.append(current)
+        current = []
+      if is_user:
+        seen_user = True
+      current.append(event)
+
+    if current:
+      turns.append(current)
+
+    return turns
+
+  @staticmethod
+  def _build_invocation_from_turn(
+      invocation_id: str,
+      events: list[Event],
+      app_details: Optional[AppDetails],
+  ) -> Invocation:
+    """Builds a single Invocation from the events of one conversational turn."""
+    final_response = None
+    final_event: Optional[Event] = None
+    user_content = Content(parts=[])
+    invocation_timestamp = 0
+    output_transcript_parts: list[str] = []
+    events_to_add = []
+
+    for event in events:
+      current_author = (event.author or _DEFAULT_AUTHOR).lower()
+
+      if current_author == _USER_AUTHOR:
+        # If the author is the user, then we just identify it and move on
+        # to the next event.
+        if event.content is not None:
+          user_content = event.content
+        elif event.input_transcription and event.input_transcription.text:
+          # Live (voice) sessions record the user turn as an input audio
+          # transcription rather than as text content. Capture the transcript
+          # so the invocation has a valid user_content.
+          user_content = Content(
+              role="user",
+              parts=[types.Part(text=event.input_transcription.text)],
+          )
+        invocation_timestamp = event.timestamp
+        continue
+
+      # Live (voice) sessions stream the agent's reply as audio with the text
+      # carried in output transcription rather than in event content. Collect
+      # that transcript so it can serve as the final response when no
+      # content-based response exists.
+      if event.output_transcription and event.output_transcription.text:
+        output_transcript_parts.append(event.output_transcription.text)
+
+      if event.content and event.content.parts:
+        if event.is_final_response():
+          final_response = event.content
+          final_event = event
+
+        for p in event.content.parts:
+          if p.function_call or p.function_response or p.text or p.inline_data:
+            events_to_add.append(event)
+            break
+
+    if final_response is None and output_transcript_parts:
+      final_response = Content(
+          role="model",
+          parts=[types.Part(text="".join(output_transcript_parts))],
+      )
+
+    invocation_events = [
+        InvocationEvent(
+            author=e.author, content=e.content, timestamp=e.timestamp
+        )
+        for e in events_to_add
+        if final_event is None or e is not final_event or e.get_function_calls()
+    ]
+    return Invocation(
+        invocation_id=invocation_id,
+        user_content=user_content,
+        final_response=final_response,
+        intermediate_data=InvocationEvents(invocation_events=invocation_events),
+        creation_timestamp=invocation_timestamp,
+        app_details=app_details,
+    )
 
   @staticmethod
   def _get_app_details_by_invocation_id(

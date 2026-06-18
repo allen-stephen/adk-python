@@ -419,3 +419,34 @@ class TestGcsEvalSetsManager:
           app_name, eval_set_id, eval_case_id
       )
     mock_write_eval_set_to_blob.assert_not_called()
+
+  def test_gcs_eval_sets_manager_delete_eval_set_success(
+      self, gcs_eval_sets_manager
+  ):
+    app_name = "test_app"
+    eval_set_id = "test_eval_set"
+    mock_eval_set = EvalSet(eval_set_id=eval_set_id, eval_cases=[])
+    eval_set_blob_name = gcs_eval_sets_manager._get_eval_set_blob_name(
+        app_name, eval_set_id
+    )
+    blob = gcs_eval_sets_manager.bucket.blob(eval_set_blob_name)
+    blob.upload_from_string(mock_eval_set.model_dump_json())
+
+    gcs_eval_sets_manager.delete_eval_set(app_name, eval_set_id)
+
+    assert not blob.exists()
+    assert gcs_eval_sets_manager.get_eval_set(app_name, eval_set_id) is None
+
+  def test_gcs_eval_sets_manager_delete_eval_set_not_found(
+      self, gcs_eval_sets_manager, mocker
+  ):
+    app_name = "test_app"
+    eval_set_id = "missing_set"
+    mocker.patch.object(
+        gcs_eval_sets_manager, "get_eval_set", return_value=None
+    )
+
+    with pytest.raises(
+        NotFoundError, match=f"Eval set `{eval_set_id}` not found."
+    ):
+      gcs_eval_sets_manager.delete_eval_set(app_name, eval_set_id)

@@ -52,11 +52,15 @@ from .eval_set import EvalCase
 from .eval_set_results_manager import EvalSetResultsManager
 from .eval_sets_manager import EvalSetsManager
 from .evaluation_generator import EvaluationGenerator
+from .evaluator import BatchableEvaluator
 from .evaluator import EvalStatus
 from .evaluator import EvaluationResult
 from .evaluator import PerInvocationResult
 from .metric_evaluator_registry import DEFAULT_METRIC_EVALUATOR_REGISTRY
 from .metric_evaluator_registry import MetricEvaluatorRegistry
+from .simulation.live_conversation_materializer import materialize_conversation
+from .simulation.live_conversation_scenario import LiveConversationScenario
+from .simulation.persona_live_conversation import PersonaLiveConversationRunner
 from .simulation.user_simulator_provider import UserSimulatorProvider
 
 logger = logging.getLogger('google_adk.' + __name__)
@@ -177,12 +181,20 @@ class LocalEvalService(BaseEvalService):
 
     async def run_inference(eval_case):
       async with semaphore:
+        # A persona scenario saved on the eval case takes precedence, so a saved
+        # persona case is re-runnable on its own. Fall back to the scenario
+        # supplied in the request (ad-hoc runs from the persona composer).
+        live_persona_scenario = (
+            eval_case.live_persona_scenario
+            or inference_request.inference_config.live_persona_scenario
+        )
         return await self._perform_inference_single_eval_item(
             app_name=inference_request.app_name,
             eval_set_id=inference_request.eval_set_id,
             eval_case=eval_case,
             root_agent=self._root_agent,
             use_live=inference_request.inference_config.use_live,
+            live_persona_scenario=live_persona_scenario,
             live_timeout_seconds=inference_request.inference_config.live_timeout_seconds,
         )
 
@@ -300,9 +312,14 @@ class LocalEvalService(BaseEvalService):
           ),
       )
 
-    if eval_case.conversation_scenario is None and len(
-        inference_result.inferences
-    ) != len(eval_case.conversation):
+    # The length check only applies to static-conversation cases. Scenario-based
+    # cases (user-simulator or persona live) generate their turns fresh, so the
+    # inference count is not known ahead of time.
+    if (
+        eval_case.conversation_scenario is None
+        and eval_case.live_persona_scenario is None
+        and len(inference_result.inferences) != len(eval_case.conversation)
+    ):
       raise ValueError(
           'Inferences should match conversations in eval case. Found'
           f'{len(inference_result.inferences)} inferences '
@@ -334,7 +351,24 @@ class LocalEvalService(BaseEvalService):
         expected_invocations, actual_invocations
     )
 
-    for eval_metric in evaluate_config.eval_metrics:
+    # Metrics backed by the same external eval service and sharing an identical
+    # request payload are computed together in a single service call (one call
+    # for the whole group instead of one per metric). Remaining metrics run
+    # individually as before.
+    batched_metrics, standalone_metrics = self._partition_metrics_for_batching(
+        evaluate_config.eval_metrics
+    )
+
+    for group_metrics in batched_metrics.values():
+      await self._evaluate_batched_metrics_for_eval_case(
+          group_metrics,
+          eval_case,
+          inference_result,
+          eval_metric_result_per_invocation,
+          overall_eval_metric_results,
+      )
+
+    for eval_metric in standalone_metrics:
       # Perform evaluation of the metric.
       await self._evaluate_metric_for_eval_case(
           eval_metric,
@@ -399,9 +433,28 @@ class LocalEvalService(BaseEvalService):
           overall_eval_status=EvalStatus.NOT_EVALUATED
       )
 
+    self._record_evaluation_result(
+        eval_metric,
+        evaluation_result,
+        eval_case,
+        eval_metric_result_per_invocation,
+        overall_eval_metric_results,
+    )
+
+  def _record_evaluation_result(
+      self,
+      eval_metric: EvalMetric,
+      evaluation_result: EvaluationResult,
+      eval_case: EvalCase,
+      eval_metric_result_per_invocation: list[EvalMetricResultPerInvocation],
+      overall_eval_metric_results: list[EvalMetricResult],
+  ):
+    """Writes a single metric's EvaluationResult into the result structures."""
+    del eval_case  # Unused; kept for signature symmetry/readability.
     # Track overall score across all invocations.
     eval_metric_result_details = EvalMetricResultDetails(
-        rubric_scores=evaluation_result.overall_rubric_scores
+        rubric_scores=evaluation_result.overall_rubric_scores,
+        explanation=evaluation_result.overall_explanation,
     )
     overall_eval_metric_results.append(
         EvalMetricResult(
@@ -433,7 +486,8 @@ class LocalEvalService(BaseEvalService):
           )
       )
       eval_metric_result_details = EvalMetricResultDetails(
-          rubric_scores=invocation_result.rubric_scores
+          rubric_scores=invocation_result.rubric_scores,
+          explanation=invocation_result.explanation,
       )
       invocation.eval_metric_results.append(
           EvalMetricResult(
@@ -443,6 +497,136 @@ class LocalEvalService(BaseEvalService):
               **eval_metric.model_dump(),
           )
       )
+
+  def _partition_metrics_for_batching(
+      self, eval_metrics: list[EvalMetric]
+  ) -> tuple[dict[str, list[EvalMetric]], list[EvalMetric]]:
+    """Splits metrics into batchable groups and standalone metrics.
+
+    Metrics whose evaluators are `BatchableEvaluator`s and report the same
+    non-None batch group key are grouped together (to be computed in a single
+    service call). A group with only one metric is treated as standalone, since
+    batching a single metric offers no benefit and keeps behavior identical to
+    the per-metric path.
+
+    Returns:
+      A tuple of (batched_groups, standalone_metrics), where batched_groups maps
+      a group key to the list of metrics in that group.
+    """
+    groups: dict[str, list[EvalMetric]] = {}
+    standalone: list[EvalMetric] = []
+
+    for eval_metric in eval_metrics:
+      group_key = None
+      try:
+        evaluator = self._metric_evaluator_registry.get_evaluator(
+            eval_metric=eval_metric
+        )
+        if isinstance(evaluator, BatchableEvaluator):
+          group_key = evaluator.get_batch_group_key()
+      except Exception as e:  # pylint: disable=broad-except
+        # If we cannot resolve the evaluator here, fall back to the standalone
+        # path which surfaces the same error per-metric.
+        logger.debug(
+            'Could not determine batch eligibility for metric `%s`: %s',
+            eval_metric.metric_name,
+            e,
+        )
+
+      if group_key is None:
+        standalone.append(eval_metric)
+      else:
+        groups.setdefault(group_key, []).append(eval_metric)
+
+    # Demote single-metric groups to standalone.
+    batched_groups: dict[str, list[EvalMetric]] = {}
+    for group_key, group_metrics in groups.items():
+      if len(group_metrics) > 1:
+        batched_groups[group_key] = group_metrics
+      else:
+        standalone.extend(group_metrics)
+
+    return batched_groups, standalone
+
+  async def _evaluate_batched_metrics_for_eval_case(
+      self,
+      group_metrics: list[EvalMetric],
+      eval_case: EvalCase,
+      inference_result: InferenceResult,
+      eval_metric_result_per_invocation: list[EvalMetricResultPerInvocation],
+      overall_eval_metric_results: list[EvalMetricResult],
+  ):
+    """Evaluates a group of batchable metrics in a single service call."""
+    try:
+      with client_label_context(EVAL_CLIENT_LABEL):
+        results_by_metric = await self._evaluate_metrics_batched(
+            group_metrics=group_metrics,
+            actual_invocations=inference_result.inferences,
+            expected_invocations=eval_case.conversation,
+        )
+    except Exception as e:  # pylint: disable=broad-except
+      # A batched failure should not be more fatal than a per-metric failure:
+      # record every metric in the group as NOT_EVALUATED.
+      logger.error(
+          'Batched metric evaluation failed for metrics %s for eval case id'
+          " '%s' with following error `%s`",
+          [m.metric_name for m in group_metrics],
+          eval_case.eval_id,
+          e,
+          exc_info=True,
+      )
+      results_by_metric = {
+          m.metric_name: EvaluationResult(
+              overall_eval_status=EvalStatus.NOT_EVALUATED
+          )
+          for m in group_metrics
+      }
+
+    for eval_metric in group_metrics:
+      evaluation_result = results_by_metric.get(
+          eval_metric.metric_name,
+          EvaluationResult(overall_eval_status=EvalStatus.NOT_EVALUATED),
+      )
+      self._record_evaluation_result(
+          eval_metric,
+          evaluation_result,
+          eval_case,
+          eval_metric_result_per_invocation,
+          overall_eval_metric_results,
+      )
+
+  async def _evaluate_metrics_batched(
+      self,
+      group_metrics: list[EvalMetric],
+      actual_invocations: list[Invocation],
+      expected_invocations: Optional[list[Invocation]],
+  ) -> dict[str, EvaluationResult]:
+    """Returns per-metric EvaluationResults from a single batched evaluator call."""
+    # Any member of the group can perform the batched call; they share a facade.
+    lead_evaluator = self._metric_evaluator_registry.get_evaluator(
+        eval_metric=group_metrics[0]
+    )
+    assert isinstance(lead_evaluator, BatchableEvaluator)
+
+    batch_specs = []
+    for eval_metric in group_metrics:
+      evaluator = self._metric_evaluator_registry.get_evaluator(
+          eval_metric=eval_metric
+      )
+      assert isinstance(evaluator, BatchableEvaluator)
+      batch_specs.append(evaluator.get_batch_spec())
+
+    if inspect.iscoroutinefunction(lead_evaluator.evaluate_batch):
+      return await lead_evaluator.evaluate_batch(
+          batch_specs=batch_specs,
+          actual_invocations=actual_invocations,
+          expected_invocations=expected_invocations,
+      )
+    return lead_evaluator.evaluate_batch(
+        batch_specs=batch_specs,
+        actual_invocations=actual_invocations,
+        expected_invocations=expected_invocations,
+    )
 
   async def _evaluate_metric(
       self,
@@ -504,6 +688,7 @@ class LocalEvalService(BaseEvalService):
       root_agent: BaseAgent,
       use_live: bool,
       live_timeout_seconds: int,
+      live_persona_scenario: Optional[LiveConversationScenario] = None,
   ) -> InferenceResult:
     initial_session = eval_case.session_input
     session_id = self._session_id_supplier()
@@ -514,9 +699,25 @@ class LocalEvalService(BaseEvalService):
         session_id=session_id,
     )
 
+    # Match the user_id used at evaluate-time so persisted artifacts (e.g. live
+    # audio) are fetchable under the same user the result references.
+    user_id = (
+        eval_case.session_input.user_id
+        if eval_case.session_input and eval_case.session_input.user_id
+        else 'test_user_id'
+    )
+
     try:
       with client_label_context(EVAL_CLIENT_LABEL):
-        if use_live:
+        if live_persona_scenario is not None:
+          inferences = await self._run_persona_live_conversation(
+              app_name=app_name,
+              root_agent=root_agent,
+              session_id=session_id,
+              scenario=live_persona_scenario,
+              user_id=user_id,
+          )
+        elif use_live:
           inferences = await EvaluationGenerator._generate_inferences_from_root_agent_live(
               root_agent=root_agent,
               user_simulator=self._user_simulator_provider.provide(eval_case),
@@ -558,3 +759,23 @@ class LocalEvalService(BaseEvalService):
       inference_result.status = InferenceStatus.FAILURE
       inference_result.error_message = str(e)
       return inference_result
+
+  async def _run_persona_live_conversation(
+      self,
+      *,
+      app_name: str,
+      root_agent: BaseAgent,
+      session_id: str,
+      scenario: LiveConversationScenario,
+      user_id: str,
+  ) -> list[Invocation]:
+    """Runs a persona-driven audio-to-audio conversation and materializes it."""
+    runner = PersonaLiveConversationRunner(
+        sut_agent=root_agent,
+        app_name=app_name,
+        user_id=user_id,
+        session_service=self._session_service,
+        artifact_service=self._artifact_service,
+    )
+    conversation = await runner.run(scenario, session_id=session_id)
+    return materialize_conversation(conversation)
