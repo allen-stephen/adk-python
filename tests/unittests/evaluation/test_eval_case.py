@@ -287,8 +287,8 @@ def test_conversation_and_conversation_scenario_mutual_exclusion():
   with pytest.raises(
       ValueError,
       match=(
-          'Exactly one of conversation, conversation_scenario and'
-          ' live_persona_scenario must be provided in an EvalCase.'
+          'Exactly one of conversation and conversation_scenario must be'
+          ' provided in an EvalCase.'
       ),
   ):
     EvalCase(eval_id='test_id')
@@ -296,8 +296,8 @@ def test_conversation_and_conversation_scenario_mutual_exclusion():
   with pytest.raises(
       ValueError,
       match=(
-          'Exactly one of conversation, conversation_scenario and'
-          ' live_persona_scenario must be provided in an EvalCase.'
+          'Exactly one of conversation and conversation_scenario must be'
+          ' provided in an EvalCase.'
       ),
   ):
     EvalCase(
@@ -311,37 +311,12 @@ def test_conversation_and_conversation_scenario_mutual_exclusion():
   EvalCase(eval_id='test_id', conversation_scenario=test_conversation_scenario)
 
 
-def test_persona_eval_case_is_valid_without_conversation():
-  """A live_persona_scenario alone is a valid eval case."""
-  from google.adk.evaluation.simulation.live_conversation_scenario import LiveConversationScenario
-  from google.adk.evaluation.simulation.persona import Persona
+def test_eval_case_has_no_voice_profile_field():
+  """Voice/audio is run configuration, not eval-case data.
 
-  scenario = LiveConversationScenario(
-      persona=Persona(id='p', character_prompt='c', goal='g'), max_turns=3
-  )
-
-  eval_case = EvalCase(eval_id='persona_id', live_persona_scenario=scenario)
-
-  assert eval_case.live_persona_scenario is scenario
-  assert eval_case.conversation is None
-  assert eval_case.conversation_scenario is None
-
-
-def test_persona_eval_case_rejects_extra_conversation():
-  """A persona case must not also carry a conversation/conversation_scenario."""
-  from google.adk.evaluation.simulation.live_conversation_scenario import LiveConversationScenario
-  from google.adk.evaluation.simulation.persona import Persona
-
-  scenario = LiveConversationScenario(
-      persona=Persona(id='p', character_prompt='c', goal='g'), max_turns=3
-  )
-
-  with pytest.raises(
-      ValueError,
-      match='must not also provide a conversation or conversation_scenario',
-  ):
-    EvalCase(
-        eval_id='persona_id',
-        live_persona_scenario=scenario,
-        conversation=[],
-    )
+  An eval case is pure stimulus + intent; how a run is voiced (voice,
+  transport, realism, barge-in) is supplied at run time, so `voice_profile` is
+  no longer a field on the eval case (nor on its scenario).
+  """
+  assert 'voice_profile' not in EvalCase.model_fields
+  assert 'voice_profile' not in ConversationScenario.model_fields

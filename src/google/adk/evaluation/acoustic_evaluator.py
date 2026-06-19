@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A local acoustic metric: response latency for live (voice) eval.
+"""A local acoustic metric: speaking rate for live (voice) eval.
 
-Latency is the single most-felt quality of a voice agent and it can be measured
-locally, with no cloud project, from event timestamps captured during a live
-run. This evaluator measures, per invocation, the time between the user's turn
-and the agent's first response, and passes when it is at or below a threshold.
+Beyond latency, *how* an agent sounds matters — a voice agent that talks too
+fast or too slow is harder to follow. Speaking rate (words per second of spoken
+audio) is a simple, local proxy for this. It is computed from the agent's
+transcript and the duration of its captured audio, with no cloud project, and it
+establishes the seam that richer acoustic metrics (turn-taking, talk-ratio,
+intelligibility) will plug into.
 """
 
 from __future__ import annotations
@@ -30,7 +32,6 @@ from typing_extensions import override
 
 from .eval_case import ConversationScenario
 from .eval_case import Invocation
-from .eval_case import InvocationEvents
 from .eval_metrics import BaseCriterion
 from .eval_metrics import EvalMetric
 from .evaluator import EvalStatus
@@ -40,20 +41,26 @@ from .evaluator import PerInvocationResult
 
 logger = logging.getLogger("google_adk." + __name__)
 
-_DEFAULT_LATENCY_THRESHOLD_SECONDS = 2.0
+# A comfortable conversational speaking rate is roughly 2-3 words/second. The
+# default threshold passes runs at or below this upper bound.
+_DEFAULT_SPEAKING_RATE_THRESHOLD_WPS = 3.5
+
+# Speaking rate is words divided by audio duration. Below this duration the
+# captured audio is too short for a meaningful rate (a fragment of audio paired
+# with a full transcript yields an implausible value), so such turns are
+# reported NOT_EVALUATED rather than scored.
+_MIN_RATE_DURATION_SECONDS = 0.5
 
 
-class LatencyV1Evaluator(Evaluator):
-  """Measures the agent's response latency per invocation.
+class SpeakingRateV1Evaluator(Evaluator):
+  """Measures the agent's speaking rate (words per second) per invocation.
 
-  For each invocation, latency is the elapsed time (in seconds) between the
-  user's turn (`Invocation.creation_timestamp`) and the agent's first response
-  event. A lower latency is better, so an invocation passes when its latency is
-  at or below the configured threshold (in seconds).
+  For each invocation that has agent audio, the rate is the agent transcript's
+  word count divided by the audio duration (derived from the `AudioReference`'s
+  sample count and rate). Lower-or-equal-to-threshold passes; an invocation with
+  no agent audio or duration is reported NOT_EVALUATED rather than failed.
 
-  This metric runs entirely locally and requires no cloud project. If no agent
-  response timestamp is available for an invocation, it is reported as
-  NOT_EVALUATED rather than failed.
+  This metric runs entirely locally and requires no cloud project.
   """
 
   criterion_type: ClassVar[type[BaseCriterion]] = BaseCriterion
@@ -69,12 +76,6 @@ class LatencyV1Evaluator(Evaluator):
           " specified."
       )
 
-    # Resolve the threshold preferring the structured `criterion` (the modern
-    # field), then the legacy `eval_metric.threshold` (which the CLI and web UI
-    # actually populate), then the explicit `threshold` arg, then the default.
-    # Other evaluators read `eval_metric.threshold`, so honoring it here keeps a
-    # consistent, configured threshold instead of silently falling back to the
-    # default.
     if eval_metric and eval_metric.criterion:
       self._threshold = eval_metric.criterion.threshold
     elif eval_metric and eval_metric.threshold is not None:
@@ -82,19 +83,34 @@ class LatencyV1Evaluator(Evaluator):
     elif threshold is not None:
       self._threshold = threshold
     else:
-      self._threshold = _DEFAULT_LATENCY_THRESHOLD_SECONDS
+      self._threshold = _DEFAULT_SPEAKING_RATE_THRESHOLD_WPS
 
   @staticmethod
-  def _first_agent_event_timestamp(
-      invocation: Invocation,
-  ) -> Optional[float]:
-    intermediate_data = invocation.intermediate_data
-    if not isinstance(intermediate_data, InvocationEvents):
+  def _speaking_rate(invocation: Invocation) -> Optional[float]:
+    """Returns the agent's words-per-second for an invocation, if derivable."""
+    audio = invocation.agent_audio
+    if (
+        audio is None
+        or not audio.num_samples
+        or not audio.sample_rate_hz
+        or invocation.final_response is None
+        or not invocation.final_response.parts
+    ):
       return None
-    for event in intermediate_data.invocation_events:
-      if event.timestamp is not None:
-        return event.timestamp
-    return None
+
+    duration_seconds = audio.num_samples / audio.sample_rate_hz
+    if duration_seconds < _MIN_RATE_DURATION_SECONDS:
+      return None
+
+    word_count = sum(
+        len(part.text.split())
+        for part in invocation.final_response.parts
+        if part.text
+    )
+    if word_count == 0:
+      return None
+
+    return word_count / duration_seconds
 
   @override
   def evaluate_invocations(
@@ -104,11 +120,13 @@ class LatencyV1Evaluator(Evaluator):
       conversation_scenario: Optional[ConversationScenario] = None,
   ) -> EvaluationResult:
     per_invocation_results = []
-    latencies = []
+    rates = []
 
     for actual in actual_invocations:
-      first_response_ts = self._first_agent_event_timestamp(actual)
-      if first_response_ts is None or actual.creation_timestamp is None:
+      # A barged-in turn was cut short, so its captured audio is only a fragment
+      # and not a reliable basis for speaking rate.
+      rate = None if actual.was_interrupted else self._speaking_rate(actual)
+      if rate is None:
         per_invocation_results.append(
             PerInvocationResult(
                 actual_invocation=actual,
@@ -118,41 +136,26 @@ class LatencyV1Evaluator(Evaluator):
         )
         continue
 
-      latency = first_response_ts - actual.creation_timestamp
-      # A non-positive latency means the response timestamp and the baseline are
-      # effectively the same instant, which indicates stale/leftover audio rather
-      # than a real measurement. Report it as NOT_EVALUATED instead of a
-      # misleading 0.0 pass.
-      if latency <= 0:
-        per_invocation_results.append(
-            PerInvocationResult(
-                actual_invocation=actual,
-                score=None,
-                eval_status=EvalStatus.NOT_EVALUATED,
-            )
-        )
-        continue
-
-      latencies.append(latency)
+      rates.append(rate)
       eval_status = (
-          EvalStatus.PASSED if latency <= self._threshold else EvalStatus.FAILED
+          EvalStatus.PASSED if rate <= self._threshold else EvalStatus.FAILED
       )
       per_invocation_results.append(
           PerInvocationResult(
               actual_invocation=actual,
-              score=latency,
+              score=rate,
               eval_status=eval_status,
           )
       )
 
-    if not latencies:
+    if not rates:
       return EvaluationResult(
           overall_score=None,
           overall_eval_status=EvalStatus.NOT_EVALUATED,
           per_invocation_results=per_invocation_results,
       )
 
-    overall_score = sum(latencies) / len(latencies)
+    overall_score = sum(rates) / len(rates)
     overall_eval_status = (
         EvalStatus.PASSED
         if overall_score <= self._threshold

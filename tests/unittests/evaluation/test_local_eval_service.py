@@ -49,6 +49,8 @@ from google.adk.evaluation.local_eval_service import _copy_eval_case_rubrics_to_
 from google.adk.evaluation.local_eval_service import _copy_invocation_rubrics_to_actual_invocations
 from google.adk.evaluation.local_eval_service import LocalEvalService
 from google.adk.evaluation.metric_evaluator_registry import DEFAULT_METRIC_EVALUATOR_REGISTRY
+from google.adk.evaluation.simulation.voice_profile import LiveTransport
+from google.adk.evaluation.simulation.voice_profile import VoiceProfile
 from google.adk.models.registry import LLMRegistry
 from google.genai import types as genai_types
 import pytest
@@ -302,7 +304,6 @@ async def test_evaluate_single_inference_result_batches_metrics(
   mock_eval_case = mocker.MagicMock(spec=EvalCase)
   mock_eval_case.conversation = [invocation.model_copy(deep=True)]
   mock_eval_case.conversation_scenario = None
-  mock_eval_case.live_persona_scenario = None
   mock_eval_case.session_input = None
   mock_eval_sets_manager.get_eval_case.return_value = mock_eval_case
 
@@ -354,7 +355,6 @@ async def test_evaluate_single_inference_result_single_batchable_metric_not_batc
   mock_eval_case = mocker.MagicMock(spec=EvalCase)
   mock_eval_case.conversation = [invocation.model_copy(deep=True)]
   mock_eval_case.conversation_scenario = None
-  mock_eval_case.live_persona_scenario = None
   mock_eval_case.session_input = None
   mock_eval_sets_manager.get_eval_case.return_value = mock_eval_case
 
@@ -474,7 +474,8 @@ async def test_perform_inference_with_case_ids(
       eval_case=eval_set.eval_cases[0],
       root_agent=dummy_agent,
       use_live=False,
-      live_persona_scenario=None,
+      live_transport=LiveTransport.TEXT,
+      voice_profile=None,
       live_timeout_seconds=300,
   )
   eval_service._perform_inference_single_eval_item.assert_any_call(
@@ -483,7 +484,8 @@ async def test_perform_inference_with_case_ids(
       eval_case=eval_set.eval_cases[2],
       root_agent=dummy_agent,
       use_live=False,
-      live_persona_scenario=None,
+      live_transport=LiveTransport.TEXT,
+      voice_profile=None,
       live_timeout_seconds=300,
   )
 
@@ -527,29 +529,24 @@ async def test_perform_inference_with_use_live(
       eval_case=eval_set.eval_cases[0],
       root_agent=dummy_agent,
       use_live=True,
-      live_persona_scenario=None,
+      live_transport=LiveTransport.TEXT,
+      voice_profile=None,
       live_timeout_seconds=600,
   )
 
 
 @pytest.mark.asyncio
-async def test_perform_inference_uses_persona_scenario_from_eval_case(
+async def test_perform_inference_passes_live_transport(
     eval_service,
     dummy_agent,
     mock_eval_sets_manager,
     mocker,
 ):
-  """A persona saved on the eval case drives inference without a request scenario."""
-  from google.adk.evaluation.simulation.live_conversation_scenario import LiveConversationScenario
-  from google.adk.evaluation.simulation.persona import Persona
-
-  scenario = LiveConversationScenario(
-      persona=Persona(id="saved", character_prompt="c", goal="g"), max_turns=2
-  )
+  """The run-level live transport is forwarded to the per-item inference."""
   eval_set = EvalSet(
       eval_set_id="test_eval_set",
       eval_cases=[
-          EvalCase(eval_id="case1", live_persona_scenario=scenario),
+          EvalCase(eval_id="case1", conversation=[], session_input=None),
       ],
   )
   mock_eval_sets_manager.get_eval_set.return_value = eval_set
@@ -561,7 +558,9 @@ async def test_perform_inference_uses_persona_scenario_from_eval_case(
   inference_request = InferenceRequest(
       app_name="test_app",
       eval_set_id="test_eval_set",
-      inference_config=InferenceConfig(parallelism=1),
+      inference_config=InferenceConfig(
+          parallelism=1, live_transport=LiveTransport.TTS
+      ),
   )
 
   async for _ in eval_service.perform_inference(inference_request):
@@ -573,7 +572,8 @@ async def test_perform_inference_uses_persona_scenario_from_eval_case(
       eval_case=eval_set.eval_cases[0],
       root_agent=dummy_agent,
       use_live=False,
-      live_persona_scenario=scenario,
+      live_transport=LiveTransport.TTS,
+      voice_profile=None,
       live_timeout_seconds=300,
   )
 
@@ -633,7 +633,6 @@ async def test_evaluate_success(
   mock_eval_case = mocker.MagicMock(spec=EvalCase)
   mock_eval_case.conversation = [invocation.model_copy(deep=True)]
   mock_eval_case.conversation_scenario = None
-  mock_eval_case.live_persona_scenario = None
   mock_eval_case.session_input = None
   mock_eval_sets_manager.get_eval_case.return_value = mock_eval_case
 
@@ -710,7 +709,6 @@ async def test_evaluate_single_inference_result(
       invocation.model_copy(deep=True),
   ]
   mock_eval_case.conversation_scenario = None
-  mock_eval_case.live_persona_scenario = None
   mock_eval_case.session_input = None
   mock_eval_sets_manager.get_eval_case.return_value = mock_eval_case
 
@@ -761,7 +759,6 @@ async def test_evaluate_single_inference_result_failed_without_inferences(
   mock_eval_case = mocker.MagicMock(spec=EvalCase)
   mock_eval_case.conversation = []
   mock_eval_case.conversation_scenario = None
-  mock_eval_case.live_persona_scenario = None
   mock_eval_case.session_input = None
   mock_eval_sets_manager.get_eval_case.return_value = mock_eval_case
 
@@ -1175,7 +1172,8 @@ async def test_perform_inference_single_eval_item_live(
       eval_case=eval_case,
       root_agent=dummy_agent,
       use_live=True,
-      live_persona_scenario=None,
+      live_transport=LiveTransport.TEXT,
+      voice_profile=None,
       live_timeout_seconds=600,
   )
 
@@ -1215,7 +1213,8 @@ async def test_perform_inference_single_eval_item_non_live(
       eval_case=eval_case,
       root_agent=dummy_agent,
       use_live=False,
-      live_persona_scenario=None,
+      live_transport=LiveTransport.TEXT,
+      voice_profile=None,
       live_timeout_seconds=300,
   )
 
@@ -1227,4 +1226,30 @@ async def test_perform_inference_single_eval_item_non_live(
       session_service=eval_service._session_service,
       artifact_service=eval_service._artifact_service,
       memory_service=eval_service._memory_service,
+  )
+
+
+def test_resolve_transport_uses_run_level_default():
+  """With no voice profile, the run-level transport is used."""
+  assert (
+      LocalEvalService._resolve_transport(None, LiveTransport.TTS)
+      == LiveTransport.TTS
+  )
+
+
+def test_resolve_transport_voice_profile_pins_transport():
+  """A run-level voice profile's transport takes precedence."""
+  voice_profile = VoiceProfile(transport=LiveTransport.NATIVE_AUDIO)
+  assert (
+      LocalEvalService._resolve_transport(voice_profile, LiveTransport.TEXT)
+      == LiveTransport.NATIVE_AUDIO
+  )
+
+
+def test_resolve_transport_voice_profile_without_transport_falls_back():
+  """A voice profile without a transport falls back to the run-level one."""
+  voice_profile = VoiceProfile(voice_name="Kore")
+  assert (
+      LocalEvalService._resolve_transport(voice_profile, LiveTransport.TTS)
+      == LiveTransport.TTS
   )

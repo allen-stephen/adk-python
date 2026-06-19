@@ -97,6 +97,7 @@ def _materialize_turn(
       agent_audio=sut.audio_reference if sut else None,
       intermediate_data=_build_intermediate_data(sut, sut_author=sut_author),
       creation_timestamp=_latency_baseline(persona, sut),
+      was_interrupted=sut.was_interrupted if sut else False,
       app_details=app_details,
   )
 

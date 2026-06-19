@@ -16,56 +16,77 @@
 
 from __future__ import annotations
 
-from google.adk.evaluation.simulation.persona import Persona
+from google.adk.evaluation.conversation_scenarios import ConversationScenario
 from google.adk.evaluation.simulation.persona_customer_agent import PersonaCustomerAgentFactory
+from google.adk.evaluation.simulation.user_simulator_personas import UserBehavior
+from google.adk.evaluation.simulation.user_simulator_personas import UserPersona
+from google.adk.evaluation.simulation.voice_profile import VoiceProfile
 from google.adk.models.google_llm import Gemini
 
 
-def _make_persona(**overrides) -> Persona:
+def _make_scenario(**overrides) -> ConversationScenario:
   defaults = dict(
-      id="hungry_customer",
-      character_prompt="You are a hungry customer ordering lunch.",
-      goal="Order a burger and fries.",
-      voice_name="Kore",
+      starting_prompt="I'd like to order lunch.",
+      conversation_plan="Order a burger and fries.",
   )
   defaults.update(overrides)
-  return Persona(**defaults)
+  return ConversationScenario(**defaults)
 
 
-def test_build_uses_persona_voice():
-  """The built agent speaks with the persona's prebuilt voice."""
-  agent = PersonaCustomerAgentFactory().build(_make_persona())
+def test_build_uses_run_level_voice_profile_voice():
+  """The built agent speaks with the run-level voice profile's prebuilt voice."""
+  agent = PersonaCustomerAgentFactory().build(
+      _make_scenario(), voice_profile=VoiceProfile(voice_name="Kore")
+  )
 
   assert isinstance(agent.model, Gemini)
   voice = agent.model.speech_config.voice_config.prebuilt_voice_config
   assert voice.voice_name == "Kore"
 
 
-def test_system_instruction_embeds_character_and_goal():
-  """The persona's character prompt and goal appear in the instruction."""
-  agent = PersonaCustomerAgentFactory().build(_make_persona())
+def test_build_defaults_voice_when_no_profile():
+  """A build without a voice profile still uses a default voice."""
+  agent = PersonaCustomerAgentFactory().build(_make_scenario())
 
-  assert "hungry customer ordering lunch" in agent.instruction
+  voice = agent.model.speech_config.voice_config.prebuilt_voice_config
+  assert voice.voice_name == "Aoede"
+
+
+def test_system_instruction_embeds_plan_and_starting_prompt():
+  """The scenario's plan and starting prompt appear in the instruction."""
+  agent = PersonaCustomerAgentFactory().build(_make_scenario())
+
   assert "Order a burger and fries." in agent.instruction
+  assert "I'd like to order lunch." in agent.instruction
 
 
-def test_model_resolution_order():
-  """Model resolves from arg, then persona.model, then factory default."""
-  factory = PersonaCustomerAgentFactory(default_model="default-live")
-
-  from_default = factory.build(_make_persona())
-  from_persona = factory.build(_make_persona(model="persona-live"))
-  from_arg = factory.build(
-      _make_persona(model="persona-live"), model="arg-live"
+def test_system_instruction_embeds_persona_description():
+  """A user persona's description is woven into the instruction."""
+  persona = UserPersona(
+      id="impatient",
+      description="A user who is in a rush and easily frustrated.",
+      behaviors=[
+          UserBehavior(
+              name="Terse",
+              description="Short replies.",
+              behavior_instructions=["Keep it under 10 words."],
+              violation_rubrics=["Response over 10 words."],
+          )
+      ],
+  )
+  agent = PersonaCustomerAgentFactory().build(
+      _make_scenario(user_persona=persona)
   )
 
+  assert "in a rush" in agent.instruction
+
+
+def test_model_resolution_prefers_arg_then_default():
+  """Model resolves from the explicit arg, else the factory default."""
+  factory = PersonaCustomerAgentFactory(default_model="default-live")
+
+  from_default = factory.build(_make_scenario())
+  from_arg = factory.build(_make_scenario(), model="arg-live")
+
   assert from_default.model.model == "default-live"
-  assert from_persona.model.model == "persona-live"
   assert from_arg.model.model == "arg-live"
-
-
-def test_agent_name_is_namespaced_by_persona_id():
-  """The agent name is derived from the persona id."""
-  agent = PersonaCustomerAgentFactory().build(_make_persona())
-
-  assert agent.name == "persona_hungry_customer"

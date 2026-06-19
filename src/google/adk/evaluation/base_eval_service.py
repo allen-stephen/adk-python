@@ -29,7 +29,8 @@ from .constants import DEFAULT_LIVE_TIMEOUT_SECONDS
 from .eval_case import Invocation
 from .eval_metrics import EvalMetric
 from .eval_result import EvalCaseResult
-from .simulation.live_conversation_scenario import LiveConversationScenario
+from .simulation.voice_profile import LiveTransport
+from .simulation.voice_profile import VoiceProfile
 
 
 class EvaluateConfig(BaseModel):
@@ -89,12 +90,28 @@ could also overwhelm those tools.""",
 inference. This is required for Live API models (e.g., gemini-*-live-*).""",
   )
 
-  live_persona_scenario: Optional[LiveConversationScenario] = Field(
+  live_transport: LiveTransport = Field(
+      default=LiveTransport.TEXT,
+      description="""How user turns are carried to the agent under test.
+
+`TEXT` runs the standard (non-live) path. `TTS` synthesizes each user turn to
+audio and streams it to a live agent. `NATIVE_AUDIO` drives a native-audio
+persona agent that hears and speaks (and supports reactive barge-in).
+
+This is a convenience shortcut; if `voice_profile.transport` is set it takes
+precedence.""",
+  )
+
+  voice_profile: Optional[VoiceProfile] = Field(
       default=None,
-      description="""When set, run a persona-driven audio-to-audio live
-conversation: a synthetic persona agent speaks with the agent under test, both
-in audio. This is the live-native evaluation path and takes precedence over the
-text-driven `use_live` path.""",
+      description="""Run-level voice, realism, and barge-in settings applied to
+audio runs.
+
+An eval case is pure stimulus + intent; how the run is voiced (which voice,
+language, transport, background noise, speaking rate, barge-in behavior) is run
+configuration and lives here, applied uniformly across the run's cases. When
+unset, audio runs use a default `VoiceProfile`. When `voice_profile.transport`
+is set it takes precedence over `live_transport`.""",
   )
 
   live_timeout_seconds: int = Field(

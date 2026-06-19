@@ -21,6 +21,7 @@ from ..utils.feature_decorator import experimental
 from .custom_metric_evaluator import _CustomMetricEvaluator
 from .eval_metrics import EvalMetric
 from .eval_metrics import MetricInfo
+from .acoustic_evaluator import SpeakingRateV1Evaluator
 from .eval_metrics import PrebuiltMetrics
 from .evaluator import Evaluator
 from .final_response_match_v2 import FinalResponseMatchV2Evaluator
@@ -38,6 +39,7 @@ from .metric_info_providers import RubricBasedFinalResponseQualityV1EvaluatorMet
 from .metric_info_providers import RubricBasedMultiTurnTrajectoryMetricInfoProvider
 from .metric_info_providers import RubricBasedToolUseV1EvaluatorMetricInfoProvider
 from .metric_info_providers import SafetyEvaluatorV1MetricInfoProvider
+from .metric_info_providers import SpeakingRateV1MetricInfoProvider
 from .metric_info_providers import TrajectoryEvaluatorMetricInfoProvider
 from .multi_turn_task_success_evaluator import MultiTurnTaskSuccessV1Evaluator
 from .multi_turn_tool_use_quality_evaluator import MultiTurnToolUseQualityV1Evaluator
@@ -175,6 +177,10 @@ def _get_default_metric_evaluator_registry() -> MetricEvaluatorRegistry:
   metric_evaluator_registry.register_evaluator(
       metric_info=LatencyV1MetricInfoProvider().get_metric_info(),
       evaluator=LatencyV1Evaluator,
+  )
+  metric_evaluator_registry.register_evaluator(
+      metric_info=SpeakingRateV1MetricInfoProvider().get_metric_info(),
+      evaluator=SpeakingRateV1Evaluator,
   )
 
   return metric_evaluator_registry

@@ -28,7 +28,6 @@ from .app_details import AppDetails
 from .common import EvalBaseModel
 from .conversation_scenarios import ConversationScenario
 from .eval_rubrics import Rubric
-from .simulation.live_conversation_scenario import LiveConversationScenario
 
 
 class IntermediateData(EvalBaseModel):
@@ -106,6 +105,13 @@ class AudioReference(EvalBaseModel):
   sample_rate_hz: int = 16000
   """The sample rate of the audio in Hertz."""
 
+  num_samples: Optional[int] = None
+  """The number of audio samples, if known.
+
+  Together with `sample_rate_hz` this gives the audio duration in seconds, which
+  local acoustic metrics (e.g. speaking rate) use without re-reading the audio.
+  """
+
 
 class Invocation(EvalBaseModel):
   """Represents a single invocation."""
@@ -142,6 +148,14 @@ class Invocation(EvalBaseModel):
 
   creation_timestamp: float = 0.0
   """Timestamp for the current invocation, primarily intended for debugging purposes."""
+
+  was_interrupted: bool = False
+  """Whether the agent's turn was cut short by a user barge-in.
+
+  Set for live (voice) eval turns the simulated user interrupted. Acoustic
+  metrics may treat such turns specially (e.g. skip speaking-rate scoring) since
+  the captured audio and transcript can be only a partial fragment.
+  """
 
   rubrics: Optional[list[Rubric]] = Field(
       default=None,
@@ -197,15 +211,6 @@ class EvalCase(EvalBaseModel):
   `conversation_scenario`, but not both.
   """
 
-  live_persona_scenario: Optional[LiveConversationScenario] = None
-  """A persona-driven audio-to-audio live conversation to run for this case.
-
-  When set, this eval case represents a persona (voice) eval: a synthetic
-  persona agent holds a spoken conversation with the agent under test. The
-  conversation turns are generated fresh each run, so a persona case does not
-  carry a static `conversation` or a text `conversation_scenario`.
-  """
-
   session_input: Optional[SessionInput] = None
   """Session input that will be passed on to the Agent during eval.
      It is common for Agents state to be initialized to some initial/default value,
@@ -225,24 +230,13 @@ class EvalCase(EvalBaseModel):
 
   @model_validator(mode="after")
   def ensure_valid_eval_case_input(self) -> EvalCase:
-    # A persona (live voice) case is defined solely by its live_persona_scenario
-    # and carries neither a static conversation nor a text conversation_scenario.
-    if self.live_persona_scenario is not None:
-      if (
-          self.conversation is not None
-          or self.conversation_scenario is not None
-      ):
-        raise ValueError(
-            "A live_persona_scenario eval case must not also provide a"
-            " conversation or conversation_scenario."
-        )
-      return self
-
-    # Otherwise, exactly one of conversation / conversation_scenario is required.
+    # Exactly one of conversation / conversation_scenario is required. An eval
+    # case is pure stimulus + intent; how it is run (text vs. audio, voice,
+    # realism, barge-in) is run configuration, not case data.
     if (self.conversation is None) == (self.conversation_scenario is None):
       raise ValueError(
-          "Exactly one of conversation, conversation_scenario and"
-          " live_persona_scenario must be provided in an EvalCase."
+          "Exactly one of conversation and conversation_scenario must be"
+          " provided in an EvalCase."
       )
     return self
 

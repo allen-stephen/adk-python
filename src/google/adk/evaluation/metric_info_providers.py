@@ -39,6 +39,24 @@ class LatencyV1MetricInfoProvider(MetricInfoProvider):
     )
 
 
+class SpeakingRateV1MetricInfoProvider(MetricInfoProvider):
+  """Metric info provider for SpeakingRateV1Evaluator."""
+
+  def get_metric_info(self) -> MetricInfo:
+    return MetricInfo(
+        metric_name=PrebuiltMetrics.SPEAKING_RATE_V1.value,
+        description=(
+            "This acoustic metric measures the agent's speaking rate in words"
+            " per second for live (voice) eval: the agent transcript's word"
+            " count over the duration of its spoken audio. Lower values are"
+            " calmer/clearer. It runs locally with no cloud project."
+        ),
+        metric_value_info=MetricValueInfo(
+            interval=Interval(min_value=0.0, max_value=20.0)
+        ),
+    )
+
+
 class TrajectoryEvaluatorMetricInfoProvider(MetricInfoProvider):
   """Metric info provider for TrajectoryEvaluator."""
 

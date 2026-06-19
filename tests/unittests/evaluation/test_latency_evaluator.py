@@ -85,6 +85,34 @@ def test_missing_agent_timestamp_is_not_evaluated():
   )
 
 
+def test_non_positive_latency_is_not_evaluated():
+  """A zero/negative latency (stale audio) is NOT_EVALUATED, not a 0.0 pass."""
+  evaluator = LatencyV1Evaluator(threshold=2.0)
+  invocation = _make_invocation(user_ts=100.0, first_agent_ts=100.0)
+
+  result = evaluator.evaluate_invocations([invocation])
+
+  assert result.overall_eval_status == EvalStatus.NOT_EVALUATED
+  assert result.overall_score is None
+  assert result.per_invocation_results[0].eval_status == (
+      EvalStatus.NOT_EVALUATED
+  )
+
+
+def test_non_positive_latency_excluded_from_average():
+  """A stale (non-positive) turn is excluded; the valid turn drives the score."""
+  evaluator = LatencyV1Evaluator(threshold=10.0)
+  invocations = [
+      _make_invocation(user_ts=0.0, first_agent_ts=2.0),
+      _make_invocation(user_ts=5.0, first_agent_ts=5.0),  # stale, latency 0
+  ]
+
+  result = evaluator.evaluate_invocations(invocations)
+
+  assert result.overall_score == 2.0
+  assert result.overall_eval_status == EvalStatus.PASSED
+
+
 def test_overall_score_is_average_latency():
   """The overall score is the mean per-invocation latency."""
   evaluator = LatencyV1Evaluator(threshold=10.0)

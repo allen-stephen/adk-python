@@ -15,23 +15,14 @@
 from __future__ import annotations
 
 import logging
-import re
 from typing import Optional
-from typing import TYPE_CHECKING
 
 from ..errors.not_found_error import NotFoundError
-from .conversation_scenarios import ConversationScenario
 from .eval_case import EvalCase
 from .eval_set import EvalSet
 from .eval_sets_manager import EvalSetsManager
 
-if TYPE_CHECKING:
-  from .simulation.persona import Persona
-
 logger = logging.getLogger("google_adk." + __name__)
-
-# Eval set/case ids must match this pattern (enforced by LocalEvalSetsManager).
-_ID_SAFE_PATTERN = re.compile(r"[^a-zA-Z0-9_]")
 
 
 def get_eval_set_from_app_and_id(
@@ -93,70 +84,6 @@ def update_eval_case_in_eval_set(
   eval_set.eval_cases.remove(eval_case_to_update)
   eval_set.eval_cases.append(updated_eval_case)
   return eval_set
-
-
-def _sanitize_id(value: str) -> str:
-  """Coerces an arbitrary string into a valid eval set/case id."""
-  sanitized = _ID_SAFE_PATTERN.sub("_", value)
-  return sanitized or "persona"
-
-
-def get_or_create_persona_eval_shell(
-    eval_sets_manager: EvalSetsManager,
-    *,
-    app_name: str,
-    persona: Persona,
-) -> tuple[str, str]:
-  """Returns (eval_set_id, eval_case_id) for a persona, creating them if needed.
-
-  A persona-driven live run does not need a pre-authored eval set: the
-  conversation is generated fresh from the persona. This helper provides the
-  minimal bookkeeping shell that the inference/evaluate pipeline requires — an
-  eval set containing a single placeholder eval case — so callers (the CLI and
-  the dev server) don't have to require the user to author one.
-
-  The synthesized case content is never read for a persona run (inference uses
-  the live scenario directly and metrics score only the generated conversation);
-  it exists solely so results have a set/case to attach to. The operation is
-  idempotent: re-running the same persona reuses the existing set/case.
-
-  Args:
-    eval_sets_manager: The manager used to look up / persist the shell.
-    app_name: The app the eval set belongs to.
-    persona: The persona the run is for; its id seeds the set/case ids.
-
-  Returns:
-    A tuple of (eval_set_id, eval_case_id).
-  """
-  # The eval set is named after the persona (it represents that persona), and
-  # the case represents a goal. We treat persona sets like any other eval set,
-  # so no special prefix is used.
-  safe_id = _sanitize_id(persona.id)
-  eval_set_id = safe_id
-  eval_case_id = f"{safe_id}_goal"
-
-  if eval_sets_manager.get_eval_set(app_name, eval_set_id) is None:
-    eval_sets_manager.create_eval_set(
-        app_name=app_name, eval_set_id=eval_set_id
-    )
-
-  if (
-      eval_sets_manager.get_eval_case(app_name, eval_set_id, eval_case_id)
-      is None
-  ):
-    eval_sets_manager.add_eval_case(
-        app_name=app_name,
-        eval_set_id=eval_set_id,
-        eval_case=EvalCase(
-            eval_id=eval_case_id,
-            conversation_scenario=ConversationScenario(
-                starting_prompt=persona.goal or "Start the conversation.",
-                conversation_plan=persona.character_prompt,
-            ),
-        ),
-    )
-
-  return eval_set_id, eval_case_id
 
 
 def delete_eval_case_from_eval_set(

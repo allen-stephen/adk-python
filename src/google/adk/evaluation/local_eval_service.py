@@ -59,13 +59,19 @@ from .evaluator import PerInvocationResult
 from .metric_evaluator_registry import DEFAULT_METRIC_EVALUATOR_REGISTRY
 from .metric_evaluator_registry import MetricEvaluatorRegistry
 from .simulation.live_conversation_materializer import materialize_conversation
-from .simulation.live_conversation_scenario import LiveConversationScenario
-from .simulation.persona_live_conversation import PersonaLiveConversationRunner
 from .simulation.user_simulator_provider import UserSimulatorProvider
+from .simulation.user_turn_transport import NativeAudioPersonaTransport
+from .simulation.user_turn_transport import ProgressCallback
+from .simulation.user_turn_transport import TtsUserTurnTransport
+from .simulation.voice_profile import LiveTransport
+from .simulation.voice_profile import VoiceProfile
 
 logger = logging.getLogger('google_adk.' + __name__)
 
 EVAL_SESSION_ID_PREFIX = '___eval___session___'
+
+# Safety cap on turns for a simulated-user conversation run over audio.
+_DEFAULT_MAX_AUDIO_TURNS = 10
 
 
 def _get_session_id() -> str:
@@ -127,6 +133,7 @@ class LocalEvalService(BaseEvalService):
       session_id_supplier: Callable[[], str] = _get_session_id,
       user_simulator_provider: UserSimulatorProvider = UserSimulatorProvider(),
       memory_service: Optional[BaseMemoryService] = None,
+      audio_progress_callback: Optional[ProgressCallback] = None,
   ):
     self._root_agent = root_agent
     self._eval_sets_manager = eval_sets_manager
@@ -142,6 +149,7 @@ class LocalEvalService(BaseEvalService):
     self._session_id_supplier = session_id_supplier
     self._user_simulator_provider = user_simulator_provider
     self._memory_service = memory_service
+    self._audio_progress_callback = audio_progress_callback
 
   @override
   async def perform_inference(
@@ -181,20 +189,14 @@ class LocalEvalService(BaseEvalService):
 
     async def run_inference(eval_case):
       async with semaphore:
-        # A persona scenario saved on the eval case takes precedence, so a saved
-        # persona case is re-runnable on its own. Fall back to the scenario
-        # supplied in the request (ad-hoc runs from the persona composer).
-        live_persona_scenario = (
-            eval_case.live_persona_scenario
-            or inference_request.inference_config.live_persona_scenario
-        )
         return await self._perform_inference_single_eval_item(
             app_name=inference_request.app_name,
             eval_set_id=inference_request.eval_set_id,
             eval_case=eval_case,
             root_agent=self._root_agent,
             use_live=inference_request.inference_config.use_live,
-            live_persona_scenario=live_persona_scenario,
+            live_transport=inference_request.inference_config.live_transport,
+            voice_profile=inference_request.inference_config.voice_profile,
             live_timeout_seconds=inference_request.inference_config.live_timeout_seconds,
         )
 
@@ -313,13 +315,12 @@ class LocalEvalService(BaseEvalService):
       )
 
     # The length check only applies to static-conversation cases. Scenario-based
-    # cases (user-simulator or persona live) generate their turns fresh, so the
-    # inference count is not known ahead of time.
-    if (
-        eval_case.conversation_scenario is None
-        and eval_case.live_persona_scenario is None
-        and len(inference_result.inferences) != len(eval_case.conversation)
-    ):
+    # cases (user simulation) generate their turns fresh, so the inference count
+    # is not known ahead of time. A static script performed over audio still
+    # yields one inference per scripted user turn, so the check holds there too.
+    if eval_case.conversation_scenario is None and len(
+        inference_result.inferences
+    ) != len(eval_case.conversation):
       raise ValueError(
           'Inferences should match conversations in eval case. Found'
           f'{len(inference_result.inferences)} inferences '
@@ -687,8 +688,9 @@ class LocalEvalService(BaseEvalService):
       eval_case: EvalCase,
       root_agent: BaseAgent,
       use_live: bool,
+      live_transport: LiveTransport,
+      voice_profile: Optional[VoiceProfile],
       live_timeout_seconds: int,
-      live_persona_scenario: Optional[LiveConversationScenario] = None,
   ) -> InferenceResult:
     initial_session = eval_case.session_input
     session_id = self._session_id_supplier()
@@ -707,14 +709,23 @@ class LocalEvalService(BaseEvalService):
         else 'test_user_id'
     )
 
+    # Transport is run configuration: the run-level voice profile may pin it,
+    # otherwise the run-level live_transport is used.
+    effective_transport = self._resolve_transport(voice_profile, live_transport)
+
     try:
       with client_label_context(EVAL_CLIENT_LABEL):
-        if live_persona_scenario is not None:
-          inferences = await self._run_persona_live_conversation(
+        if effective_transport in (
+            LiveTransport.TTS,
+            LiveTransport.NATIVE_AUDIO,
+        ):
+          inferences = await self._run_audio_transport(
               app_name=app_name,
               root_agent=root_agent,
               session_id=session_id,
-              scenario=live_persona_scenario,
+              eval_case=eval_case,
+              transport=effective_transport,
+              voice_profile=voice_profile,
               user_id=user_id,
           )
         elif use_live:
@@ -760,22 +771,66 @@ class LocalEvalService(BaseEvalService):
       inference_result.error_message = str(e)
       return inference_result
 
-  async def _run_persona_live_conversation(
+  @staticmethod
+  def _resolve_transport(
+      voice_profile: Optional[VoiceProfile], run_transport: LiveTransport
+  ) -> LiveTransport:
+    """Returns the transport for the run: voice-profile pin, else run-level."""
+    if voice_profile is not None and voice_profile.transport is not None:
+      return voice_profile.transport
+    return run_transport
+
+  async def _run_audio_transport(
       self,
       *,
       app_name: str,
       root_agent: BaseAgent,
       session_id: str,
-      scenario: LiveConversationScenario,
+      eval_case: EvalCase,
+      transport: LiveTransport,
+      voice_profile: Optional[VoiceProfile],
       user_id: str,
   ) -> list[Invocation]:
-    """Runs a persona-driven audio-to-audio conversation and materializes it."""
-    runner = PersonaLiveConversationRunner(
-        sut_agent=root_agent,
-        app_name=app_name,
-        user_id=user_id,
-        session_service=self._session_service,
-        artifact_service=self._artifact_service,
+    """Runs a conversation over an audio transport and materializes it."""
+    scenario = eval_case.conversation_scenario
+    voice_profile = voice_profile or VoiceProfile()
+    user_simulator = self._user_simulator_provider.provide(eval_case)
+
+    if transport == LiveTransport.NATIVE_AUDIO:
+      audio_transport = NativeAudioPersonaTransport(
+          sut_agent=root_agent,
+          app_name=app_name,
+          user_id=user_id,
+          session_service=self._session_service,
+          artifact_service=self._artifact_service,
+      )
+    else:
+      audio_transport = TtsUserTurnTransport(
+          sut_agent=root_agent,
+          app_name=app_name,
+          user_id=user_id,
+          session_service=self._session_service,
+          artifact_service=self._artifact_service,
+      )
+
+    conversation = await audio_transport.run(
+        user_simulator=user_simulator,
+        scenario=scenario,
+        voice_profile=voice_profile,
+        max_turns=self._max_audio_turns(eval_case),
+        session_id=session_id,
+        progress_callback=self._audio_progress_callback,
     )
-    conversation = await runner.run(scenario, session_id=session_id)
     return materialize_conversation(conversation)
+
+  @staticmethod
+  def _max_audio_turns(eval_case: EvalCase) -> int:
+    """Returns the turn cap for an audio run.
+
+    A fixed script is bounded by its own length; a simulated user is capped by a
+    default so a run-off conversation still terminates (the simulator's own stop
+    signal usually ends it sooner).
+    """
+    if eval_case.conversation is not None:
+      return len(eval_case.conversation)
+    return _DEFAULT_MAX_AUDIO_TURNS

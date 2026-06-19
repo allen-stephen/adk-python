@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Builds a Live agent that role-plays a persona in audio-to-audio eval.
+"""Builds a native-audio Live agent that role-plays the simulated user.
 
-The persona agent is an ordinary ADK `LlmAgent` configured with a Live
-(native-audio) model and the persona's prebuilt voice. All of its behavior —
-how it speaks, what it wants, when it is done — lives in its system instruction,
-composed from the `Persona` (LLM-first design).
+For the native-audio transport the simulated user is itself a Live agent: it
+hears the agent-under-test's audio and replies in kind. Its behavior is composed
+from the same `ConversationScenario` that drives the text user simulator (the
+starting prompt, the conversation plan, and the optional `UserPersona`), so the
+conversation source is shared with non-live eval; only the voice comes from the
+`VoiceProfile`.
 """
 
 from __future__ import annotations
@@ -29,7 +31,8 @@ from google.genai import types
 from ...agents.llm_agent import Agent
 from ...models.google_llm import Gemini
 from ...utils.feature_decorator import experimental
-from .persona import Persona
+from ..conversation_scenarios import ConversationScenario
+from .voice_profile import VoiceProfile
 
 _DEFAULT_LIVE_MODEL = "gemini-live-2.5-flash-native-audio"
 
@@ -38,13 +41,14 @@ You are a real person having a spoken conversation. This is NOT acting — you A
 this person. Speak naturally, the way a real person talks out loud.
 
 ## WHO YOU ARE
-{character_prompt}
+{persona}
 
 ## WHAT YOU WANT
-{goal}
+{conversation_plan}
 
 ## HOW TO BEHAVE
 - Stay in character at all times and speak conversationally.
+- Open the conversation by saying, in your own words: "{starting_prompt}"
 - Pursue your goal across the conversation; you do not need to say everything at \
 once.
 - React naturally to what the other speaker says.
@@ -53,49 +57,64 @@ wrap up politely and stop.
 - Do not narrate your actions or break character.
 """
 
+_DEFAULT_PERSONA_DESCRIPTION = "an ordinary person with a goal to accomplish"
+
 
 @experimental
 class PersonaCustomerAgentFactory:
-  """Creates a Live `Agent` that role-plays a given persona."""
+  """Creates a native-audio Live `Agent` that role-plays a conversation scenario."""
 
   def __init__(self, *, default_model: str = _DEFAULT_LIVE_MODEL):
     self._default_model = default_model
 
-  def build(self, persona: Persona, *, model: Optional[str] = None) -> Agent:
-    """Builds a Live persona agent.
+  def build(
+      self,
+      scenario: ConversationScenario,
+      *,
+      voice_profile: Optional[VoiceProfile] = None,
+      model: Optional[str] = None,
+  ) -> Agent:
+    """Builds a native-audio persona agent for a scenario.
 
     Args:
-      persona: The persona to role-play.
-      model: Optional Live model override. Resolution order is this argument,
-        then `persona.model`, then the factory default.
+      scenario: The conversation scenario whose plan, starting prompt, and
+        persona drive the agent.
+      voice_profile: The run-level voice/realism settings supplying the voice.
+        When unset, a default `VoiceProfile` is used.
+      model: Optional Live model override. When unset, the factory default is
+        used.
 
     Returns:
-      An `Agent` configured with the persona's voice and system instruction.
+      An `Agent` configured with the run's voice and system instruction.
     """
-    resolved_model = model or persona.model or self._default_model
+    voice_profile = voice_profile or VoiceProfile()
+    resolved_model = model or self._default_model
 
     return Agent(
-        name=f"persona_{persona.id}",
+        name="simulated_user",
         model=Gemini(
             model=resolved_model,
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=persona.voice_name,
+                        voice_name=voice_profile.voice_name,
                     )
                 )
             ),
         ),
-        description=(
-            persona.description or f"Synthetic persona '{persona.id}'."
-        ),
-        instruction=self.build_system_instruction(persona),
+        description="Synthetic user simulator for live evaluation.",
+        instruction=self.build_system_instruction(scenario),
     )
 
   @staticmethod
-  def build_system_instruction(persona: Persona) -> str:
-    """Composes the persona agent's system instruction from the persona."""
+  def build_system_instruction(scenario: ConversationScenario) -> str:
+    """Composes the persona agent's system instruction from the scenario."""
+    persona = scenario.user_persona
+    persona_text = (
+        persona.description if persona else _DEFAULT_PERSONA_DESCRIPTION
+    )
     return _PERSONA_SYSTEM_INSTRUCTION_TEMPLATE.format(
-        character_prompt=persona.character_prompt,
-        goal=persona.goal or "Have a natural conversation.",
+        persona=persona_text,
+        conversation_plan=scenario.conversation_plan,
+        starting_prompt=scenario.starting_prompt,
     )

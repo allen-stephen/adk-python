@@ -48,10 +48,12 @@ import yaml
 
 from . import agent_graph
 from ..errors.not_found_error import NotFoundError
-from ..evaluation._eval_sets_manager_utils import get_or_create_persona_eval_shell
 from ..evaluation.base_eval_service import InferenceConfig
 from ..evaluation.base_eval_service import InferenceRequest
+from ..evaluation.conversation_scenarios import ConversationGenerationConfig
+from ..evaluation.conversation_scenarios import ConversationScenario
 from ..evaluation.eval_case import EvalCase
+from ..evaluation.eval_case import Invocation
 from ..evaluation.eval_case import SessionInput
 from ..evaluation.eval_metrics import EvalMetric
 from ..evaluation.eval_metrics import EvalMetricResult
@@ -60,7 +62,8 @@ from ..evaluation.eval_metrics import EvalStatus
 from ..evaluation.eval_metrics import MetricInfo
 from ..evaluation.eval_result import EvalSetResult
 from ..evaluation.eval_set import EvalSet
-from ..evaluation.simulation.live_conversation_scenario import LiveConversationScenario
+from ..evaluation.simulation.voice_profile import LiveTransport
+from ..evaluation.simulation.voice_profile import VoiceProfile
 from .api_server import ApiServer
 from .utils import common
 from .utils import evals
@@ -107,11 +110,22 @@ class RunEvalRequest(common.BaseModel):
           " streaming). Required for Live API models (e.g. gemini-*-live-*)."
       ),
   )
-  live_persona_scenario: Optional[LiveConversationScenario] = Field(
+  live_transport: LiveTransport = Field(
+      default=LiveTransport.TEXT,
+      description=(
+          "How user turns are carried to the agent under test: 'text', 'tts'"
+          " (synthesize each user turn to audio against a live agent), or"
+          " 'native_audio' (a native-audio persona that hears and speaks). A"
+          " convenience shortcut; if voice_profile.transport is set it takes"
+          " precedence."
+      ),
+  )
+  voice_profile: Optional[VoiceProfile] = Field(
       default=None,
       description=(
-          "When set, run a persona-driven audio-to-audio live conversation: a"
-          " synthetic persona agent speaks with the agent under test."
+          "Run-level voice, realism, and barge-in settings applied to audio"
+          " runs. How a run is voiced is run configuration, not case data, so"
+          " it is supplied here and applied uniformly across the run's cases."
       ),
   )
 
@@ -146,11 +160,33 @@ class CreateEvalSetRequest(common.BaseModel):
   eval_set: EvalSet
 
 
-class AddPersonaToEvalSetRequest(common.BaseModel):
-  """Request to save a persona as a re-runnable eval case in an eval set."""
+class AddScenarioToEvalSetRequest(common.BaseModel):
+  """Request to save a conversation scenario as a re-runnable eval case.
+
+  The scenario may carry a `voice_profile` so it can be replayed over an audio
+  transport; it is an ordinary user-simulation case and works as a text eval
+  too.
+  """
 
   eval_id: str
-  live_persona_scenario: LiveConversationScenario
+  conversation_scenario: ConversationScenario
+
+
+class AddEvalCaseRequest(common.BaseModel):
+  """Request to save a fixed (scripted) conversation as a re-runnable eval case.
+
+  Unlike `add-session`, which captures a script from a live session, this lets a
+  caller author the user turns (and optional expected responses) directly.
+  """
+
+  eval_id: str
+  conversation: list[Invocation]
+
+
+class GenerateEvalCasesResponse(common.BaseModel):
+  """Response listing the eval case ids created by scenario generation."""
+
+  eval_ids: list[str]
 
 
 class ListEvalSetsResponse(common.BaseModel):
@@ -938,17 +974,17 @@ class DevServer(ApiServer):
         raise HTTPException(status_code=400, detail=str(ve)) from ve
 
     @app.post(
-        "/dev/apps/{app_name}/eval-sets/{eval_set_id}/add-persona",
+        "/dev/apps/{app_name}/eval-sets/{eval_set_id}/add-scenario",
         response_model_exclude_none=True,
         tags=[TAG_EVALUATION],
     )
-    async def add_persona_to_eval_set(
-        app_name: str, eval_set_id: str, req: AddPersonaToEvalSetRequest
+    async def add_scenario_to_eval_set(
+        app_name: str, eval_set_id: str, req: AddScenarioToEvalSetRequest
     ) -> None:
-      """Saves a persona scenario as a re-runnable eval case in an eval set."""
+      """Saves a conversation scenario as a re-runnable eval case."""
       new_eval_case = EvalCase(
           eval_id=req.eval_id,
-          live_persona_scenario=req.live_persona_scenario,
+          conversation_scenario=req.conversation_scenario,
           creation_timestamp=time.time(),
       )
       try:
@@ -957,6 +993,83 @@ class DevServer(ApiServer):
         )
       except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve)) from ve
+
+    @app.post(
+        "/dev/apps/{app_name}/eval-sets/{eval_set_id}/add-eval-case",
+        response_model_exclude_none=True,
+        tags=[TAG_EVALUATION],
+    )
+    @app.post(
+        "/dev/apps/{app_name}/eval_sets/{eval_set_id}/add_eval_case",
+        response_model_exclude_none=True,
+        tags=[TAG_EVALUATION],
+    )
+    async def add_eval_case(
+        app_name: str, eval_set_id: str, req: AddEvalCaseRequest
+    ) -> None:
+      """Saves a fixed (scripted) conversation as a re-runnable eval case."""
+      agent_or_app = self.agent_loader.load_agent(app_name)
+      root_agent = self._get_root_agent(agent_or_app)
+      initial_session_state = create_empty_state(root_agent)
+
+      new_eval_case = EvalCase(
+          eval_id=req.eval_id,
+          conversation=req.conversation,
+          session_input=SessionInput(
+              app_name=app_name,
+              user_id="user",
+              state=initial_session_state,
+          ),
+          creation_timestamp=time.time(),
+      )
+      try:
+        self.eval_sets_manager.add_eval_case(
+            app_name, eval_set_id, new_eval_case
+        )
+      except NotFoundError as nfe:
+        raise HTTPException(status_code=404, detail=str(nfe)) from nfe
+      except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve)) from ve
+
+    @app.post(
+        "/dev/apps/{app_name}/eval-sets/{eval_set_id}/generate-eval-cases",
+        response_model_exclude_none=True,
+        tags=[TAG_EVALUATION],
+    )
+    @app.post(
+        "/dev/apps/{app_name}/eval_sets/{eval_set_id}/generate_eval_cases",
+        response_model_exclude_none=True,
+        tags=[TAG_EVALUATION],
+    )
+    async def generate_eval_cases(
+        app_name: str, eval_set_id: str, req: ConversationGenerationConfig
+    ) -> GenerateEvalCasesResponse:
+      """Synthesizes conversation scenarios and saves them as eval cases.
+
+      Uses the Vertex Gen AI Eval SDK, which requires GCP credentials.
+      """
+      from ..evaluation._scenario_generation_helper import generate_and_add_eval_cases
+
+      agent_or_app = self.agent_loader.load_agent(app_name)
+      root_agent = self._get_root_agent(agent_or_app)
+      initial_session_state = create_empty_state(root_agent)
+
+      try:
+        eval_ids = await asyncio.to_thread(
+            generate_and_add_eval_cases,
+            root_agent=root_agent,
+            config=req,
+            eval_sets_manager=self.eval_sets_manager,
+            app_name=app_name,
+            eval_set_id=eval_set_id,
+            initial_session_state=initial_session_state,
+        )
+      except ValueError as ve:
+        # Misconfiguration (e.g. missing GCP credentials) or a bad request.
+        raise HTTPException(status_code=400, detail=str(ve)) from ve
+      except Exception as e:  # pylint: disable=broad-except
+        raise HTTPException(status_code=500, detail=str(e)) from e
+      return GenerateEvalCasesResponse(eval_ids=eval_ids)
 
     @app.get(
         "/dev/apps/{app_name}/eval_sets/{eval_set_id}/evals",
@@ -1076,24 +1189,12 @@ class DevServer(ApiServer):
         from .cli_eval import _collect_eval_results
         from .cli_eval import _collect_inferences
 
-        # A persona-driven live run is generated fresh from the persona and does
-        # not require a pre-authored eval set. Synthesize (or reuse) a minimal
-        # bookkeeping shell so results have a set/case to attach to, rather than
-        # forcing the caller to create one first.
-        if req.live_persona_scenario is not None:
-          eval_set_id, persona_eval_case_id = get_or_create_persona_eval_shell(
-              self.eval_sets_manager,
-              app_name=app_name,
-              persona=req.live_persona_scenario.persona,
+        eval_set = self.eval_sets_manager.get_eval_set(app_name, eval_set_id)
+        if not eval_set:
+          raise HTTPException(
+              status_code=400, detail=f"Eval set `{eval_set_id}` not found."
           )
-          eval_case_ids = [persona_eval_case_id]
-        else:
-          eval_set = self.eval_sets_manager.get_eval_set(app_name, eval_set_id)
-          if not eval_set:
-            raise HTTPException(
-                status_code=400, detail=f"Eval set `{eval_set_id}` not found."
-            )
-          eval_case_ids = req.eval_case_ids or req.eval_ids
+        eval_case_ids = req.eval_case_ids or req.eval_ids
 
         agent_or_app = self.agent_loader.load_agent(app_name)
         root_agent = self._get_root_agent(agent_or_app)
@@ -1107,13 +1208,26 @@ class DevServer(ApiServer):
             session_service=self.session_service,
             artifact_service=self.artifact_service,
         )
+        # The run is an audio run when either the run-level transport or the
+        # voice profile's transport selects an audio transport.
+        effective_transport = (
+            req.voice_profile.transport
+            if req.voice_profile is not None
+            and req.voice_profile.transport is not None
+            else req.live_transport
+        )
+        is_audio_transport = effective_transport in (
+            LiveTransport.TTS,
+            LiveTransport.NATIVE_AUDIO,
+        )
         inference_request = InferenceRequest(
             app_name=app_name,
             eval_set_id=eval_set_id,
             eval_case_ids=eval_case_ids,
             inference_config=InferenceConfig(
-                use_live=req.use_live or req.live_persona_scenario is not None,
-                live_persona_scenario=req.live_persona_scenario,
+                use_live=req.use_live or is_audio_transport,
+                live_transport=req.live_transport,
+                voice_profile=req.voice_profile,
             ),
         )
         inference_results = await _collect_inferences(

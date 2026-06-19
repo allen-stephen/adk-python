@@ -3,30 +3,32 @@
   "name": "eval_set_1",
   "eval_cases": [
     {
-      "eval_id": "Dice_Player_persona",
-      "live_persona_scenario": {
-        "persona": {
-          "id": "Dice_Player",
-          "description": "Dice Player",
-          "character_prompt": "You are a curious, friendly person who loves dice games and wants to roll some dice and check if numbers are prime.",
-          "goal": "Roll a 20-sided die, then ask whether the result is a prime number."
-        },
-        "max_turns": 6
+      "eval_id": "dice_player_scenario_voice",
+      "conversation_scenario": {
+        "starting_prompt": "Hey, can you help me with some dice?",
+        "conversation_plan": "Ask the agent to roll a 20-sided die. After you get the result, ask the agent to check if it is prime.",
+        "user_persona": "NOVICE"
       },
       "creation_timestamp": 1781747878.713116
     },
     {
-      "eval_id": "Dice_Player_2_persona",
-      "live_persona_scenario": {
-        "persona": {
-          "id": "Dice_Player_2",
-          "description": "Dice Player 2",
-          "character_prompt": "Super terse and annoyed player, just want to get to the point.",
-          "goal": "Roll a 6 sided dice and confirm the number isn't prime.",
-          "voice_name": "Fenrir"
+      "eval_id": "dice_player_script_voice",
+      "conversation": [
+        {
+          "invocation_id": "turn_0",
+          "user_content": {
+            "role": "user",
+            "parts": [{ "text": "Please roll a 20-sided die." }]
+          }
         },
-        "max_turns": 6
-      },
+        {
+          "invocation_id": "turn_1",
+          "user_content": {
+            "role": "user",
+            "parts": [{ "text": "Is that number prime?" }]
+          }
+        }
+      ],
       "creation_timestamp": 1781754732.4576268
     }
   ],

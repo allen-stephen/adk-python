@@ -111,7 +111,7 @@ def test_adk_eval():
       eval_command,
       cli_eval.callback,
       "eval",
-      ignore_params={"enable_features", "disable_features"},
+      ignore_params={"ctx", "enable_features", "disable_features"},
   )
 
 

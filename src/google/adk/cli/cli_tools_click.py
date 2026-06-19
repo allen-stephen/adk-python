@@ -44,6 +44,8 @@ from .utils import logs
 
 if TYPE_CHECKING:
   from ..evaluation.eval_metrics import EvalMetric
+  from ..evaluation.eval_result import EvalCaseResult
+  from ..evaluation.eval_set_results_manager import EvalSetResultsManager
 
 LOG_LEVELS = click.Choice(
     ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -61,7 +63,7 @@ _REFERENCE_BASED_METRIC_NAMES = frozenset({
     "final_response_match_v2",
 })
 
-# The managed (Gen AI Eval Service) multi-turn metrics offered for persona live
+# The managed (Gen AI Eval Service) multi-turn metrics offered for audio live
 # runs via --managed_metrics. These are reference-free and valid for live.
 _MANAGED_LIVE_METRIC_DEFAULTS = (
     ("multi_turn_task_success_v1", 0.7),
@@ -73,6 +75,209 @@ _MANAGED_LIVE_METRIC_DEFAULTS = (
 # latency threshold. Kept in sync with the web UI's LOCAL_LIVE_METRICS.
 _LIVE_LATENCY_THRESHOLD_SECONDS = 5.0
 
+# A comfortable conversational speaking rate is ~2-3 words/second; pass at or
+# below this upper bound.
+_LIVE_SPEAKING_RATE_THRESHOLD_WPS = 3.5
+
+_EVAL_RESULT_FILE_EXTENSION = ".evalset_result.json"
+
+
+def _print_eval_criteria(eval_metrics: list[EvalMetric]) -> None:
+  """Prints a concise list of the metrics and thresholds being used."""
+  click.echo("Evaluation criteria:")
+  if not eval_metrics:
+    click.echo("  (none)")
+    return
+  for metric in eval_metrics:
+    click.echo(f"  {metric.metric_name} (threshold: {metric.threshold})")
+
+
+def _print_eval_run_summary(eval_results: list[EvalCaseResult]) -> None:
+  """Prints the per-eval-set and overall pass/fail/not-evaluated summary.
+
+  PASSED, FAILED and NOT_EVALUATED are reported as distinct buckets (rather than
+  collapsing the latter two into a single "failed" count) so a coding agent or
+  developer can distinguish a real regression from a metric that could not be
+  scored.
+  """
+  from ..evaluation.evaluator import EvalStatus
+
+  # eval_set_id -> [passed, failed, not_evaluated]
+  eval_run_summary: dict[str, list[int]] = {}
+  for eval_result in eval_results:
+    counts = eval_run_summary.setdefault(eval_result.eval_set_id, [0, 0, 0])
+    if eval_result.final_eval_status == EvalStatus.PASSED:
+      counts[0] += 1
+    elif eval_result.final_eval_status == EvalStatus.FAILED:
+      counts[1] += 1
+    else:
+      counts[2] += 1
+
+  click.echo(
+      "*********************************************************************"
+  )
+  click.echo("Eval Run Summary")
+
+  total_passed = total_failed = total_not_evaluated = 0
+  for eval_set_id, counts in eval_run_summary.items():
+    passed, failed, not_evaluated = counts
+    total_passed += passed
+    total_failed += failed
+    total_not_evaluated += not_evaluated
+    click.echo(f"{eval_set_id}:")
+    click.secho(f"  Tests passed: {passed}", fg="green")
+    click.secho(f"  Tests failed: {failed}", fg="red" if failed else None)
+    if not_evaluated:
+      click.secho(f"  Tests not evaluated: {not_evaluated}", fg="yellow")
+
+  click.echo(
+      "Total: "
+      f"{total_passed} passed, {total_failed} failed, "
+      f"{total_not_evaluated} not evaluated"
+  )
+
+
+def _report_written_result_files(
+    *,
+    eval_set_results_manager: EvalSetResultsManager,
+    app_name: str,
+    pre_run_result_ids: set[str],
+) -> None:
+  """Echoes the result files this run wrote, for easy discovery."""
+  try:
+    post_run_result_ids = set(
+        eval_set_results_manager.list_eval_set_results(app_name)
+    )
+  except Exception:  # pylint: disable=broad-except
+    return
+  new_result_ids = sorted(post_run_result_ids - pre_run_result_ids)
+  if not new_result_ids:
+    return
+  from ..evaluation.gcs_eval_set_results_manager import GcsEvalSetResultsManager
+  from ..evaluation.local_eval_set_results_manager import LocalEvalSetResultsManager
+
+  click.echo("Result files:")
+  for result_id in new_result_ids:
+    location = _eval_result_location(
+        eval_set_results_manager=eval_set_results_manager,
+        app_name=app_name,
+        result_id=result_id,
+        local_cls=LocalEvalSetResultsManager,
+        gcs_cls=GcsEvalSetResultsManager,
+    )
+    click.echo(f"  {location}")
+
+
+def _eval_result_location(
+    *,
+    eval_set_results_manager: EvalSetResultsManager,
+    app_name: str,
+    result_id: str,
+    local_cls: type,
+    gcs_cls: type,
+) -> str:
+  """Returns a human-readable location for a persisted eval set result."""
+  filename = result_id + _EVAL_RESULT_FILE_EXTENSION
+  if isinstance(eval_set_results_manager, local_cls):
+    return os.path.join(
+        eval_set_results_manager._get_eval_history_dir(app_name), filename
+    )
+  if isinstance(eval_set_results_manager, gcs_cls):
+    bucket = eval_set_results_manager.bucket_name
+    return f"gs://{bucket}/{app_name}/evals/eval_history/{filename}"
+  return result_id
+
+
+def _write_eval_output_file(
+    *, output_file: str, app_name: str, eval_results: list[EvalCaseResult]
+) -> None:
+  """Writes an aggregated JSON envelope of all eval results to output_file.
+
+  The envelope has a top-level ``summary`` (overall and per-eval-set pass/fail/
+  not-evaluated counts) plus the full ``eval_set_results`` list, so programmatic
+  consumers can branch on the summary without re-aggregating per-case results.
+  """
+  from ..evaluation._eval_set_results_manager_utils import create_eval_set_result
+  from ..evaluation.evaluator import EvalStatus
+
+  # Group cases back into EvalSetResult objects, preserving the on-disk schema.
+  cases_by_set: dict[str, list[EvalCaseResult]] = {}
+  for eval_result in eval_results:
+    cases_by_set.setdefault(eval_result.eval_set_id, []).append(eval_result)
+
+  eval_set_results = []
+  per_set_summary = {}
+  total_passed = total_failed = total_not_evaluated = 0
+  for eval_set_id, cases in cases_by_set.items():
+    eval_set_results.append(
+        create_eval_set_result(
+            app_name=app_name,
+            eval_set_id=eval_set_id,
+            eval_case_results=cases,
+        )
+    )
+    passed = sum(1 for c in cases if c.final_eval_status == EvalStatus.PASSED)
+    failed = sum(1 for c in cases if c.final_eval_status == EvalStatus.FAILED)
+    not_evaluated = len(cases) - passed - failed
+    per_set_summary[eval_set_id] = {
+        "passed": passed,
+        "failed": failed,
+        "not_evaluated": not_evaluated,
+    }
+    total_passed += passed
+    total_failed += failed
+    total_not_evaluated += not_evaluated
+
+  envelope = {
+      "summary": {
+          "passed": total_passed,
+          "failed": total_failed,
+          "not_evaluated": total_not_evaluated,
+          "per_eval_set": per_set_summary,
+      },
+      "eval_set_results": [
+          result.model_dump(mode="json", by_alias=True)
+          for result in eval_set_results
+      ],
+  }
+  with open(output_file, "w", encoding="utf-8") as f:
+    json.dump(envelope, f, indent=2)
+
+
+def _make_watch_progress_callback():
+  """Builds an async progress callback that streams a live run to the console.
+
+  Audio transports emit a small set of progress events as a conversation
+  unfolds; this prints them as an alternating, color-coded transcript so the
+  user can inspect both the simulated-user input and the agent-under-test output
+  in real time. Returns a coroutine callback suitable for
+  `LocalEvalService(audio_progress_callback=...)`.
+  """
+
+  async def _on_progress(event: dict) -> None:
+    event_type = event.get("type")
+    if event_type == "turn_started":
+      click.secho(f"\n── turn {event.get('turn_index')} ──", fg="white")
+    elif event_type == "transcript_update":
+      speaker = event.get("speaker")
+      text = event.get("text", "")
+      if speaker == "persona":
+        click.secho(f"  user  ▶ {text}", fg="green")
+      else:
+        click.secho(f"  agent ◀ {text}", fg="blue")
+    elif event_type == "barge_in":
+      listen = event.get("listen_seconds")
+      detail = f" after {listen}s" if listen is not None else ""
+      click.secho(f"  ⚡ user barged in{detail} (agent cut off)", fg="magenta")
+    elif event_type == "conversation_complete":
+      click.secho(
+          f"\n✓ conversation complete: {event.get('turns')} turn(s),"
+          f" reason={event.get('termination_reason')}\n",
+          fg="cyan",
+      )
+
+  return _on_progress
+
 
 def _resolve_live_eval_metrics(
     eval_metrics: list[EvalMetric],
@@ -80,13 +285,13 @@ def _resolve_live_eval_metrics(
     config_file_path: str | None,
     managed_metrics: bool,
 ) -> list[EvalMetric]:
-  """Returns the metrics to use for a persona (live) eval run.
+  """Returns the metrics to use for an audio (live) eval run.
 
-  A persona run has no golden references, so reference-based metrics do not
-  apply:
+  An audio run scores a freshly generated conversation and has no golden
+  references, so reference-based metrics do not apply:
 
-  - When no config file was supplied, we default to the local latency metric and
-    add the managed multi-turn metrics only when `managed_metrics` is set.
+  - When no config file was supplied, we default to the local acoustic metrics
+    and add the managed multi-turn metrics only when `managed_metrics` is set.
   - When a config file was supplied, we honor it but drop any reference-based
     metrics (with a warning) so the run does not hard-fail at scoring time.
 
@@ -97,7 +302,7 @@ def _resolve_live_eval_metrics(
       when no config file is supplied).
 
   Returns:
-    The metrics to run for the live persona eval.
+    The metrics to run for the live audio eval.
   """
   from ..evaluation.eval_metrics import EvalMetric
 
@@ -106,7 +311,11 @@ def _resolve_live_eval_metrics(
         EvalMetric(
             metric_name="response_latency_v1",
             threshold=_LIVE_LATENCY_THRESHOLD_SECONDS,
-        )
+        ),
+        EvalMetric(
+            metric_name="speaking_rate_v1",
+            threshold=_LIVE_SPEAKING_RATE_THRESHOLD_WPS,
+        ),
     ]
     if managed_metrics:
       resolved.extend(
@@ -114,7 +323,7 @@ def _resolve_live_eval_metrics(
           for name, threshold in _MANAGED_LIVE_METRIC_DEFAULTS
       )
     metric_names = ", ".join(m.metric_name for m in resolved)
-    print(f"Persona live run: using reference-free metrics [{metric_names}].")
+    print(f"Audio live run: using reference-free metrics [{metric_names}].")
     return resolved
 
   # A config file was supplied: honor it, but drop reference-based metrics that
@@ -123,7 +332,7 @@ def _resolve_live_eval_metrics(
   for metric in eval_metrics:
     if metric.metric_name in _REFERENCE_BASED_METRIC_NAMES:
       print(
-          f"Skipping metric '{metric.metric_name}' for the persona live run: it"
+          f"Skipping metric '{metric.metric_name}' for the audio live run: it"
           " requires a golden/expected response, which a live run does not"
           " have."
       )
@@ -1029,14 +1238,30 @@ def eval_options():
     ),
 )
 @click.option(
-    "--persona",
-    "persona_path",
-    type=click.Path(exists=True, dir_okay=False),
+    "--live_transport",
+    type=click.Choice(["text", "tts", "native_audio"]),
+    default="text",
+    show_default=True,
+    help=(
+        "Optional. How user turns are carried to the agent under test. 'text'"
+        " runs the standard path; 'tts' synthesizes each user turn to audio"
+        " against a live agent (works with fixed scripts and simulated users);"
+        " 'native_audio' drives a native-audio persona that hears and speaks"
+        " (supports reactive barge-in)."
+    ),
+)
+@click.option(
+    "--live_run_config_file",
+    type=click.Path(
+        exists=True, dir_okay=False, file_okay=True, resolve_path=True
+    ),
     default=None,
     help=(
-        "Optional. Path to a JSON file describing a persona for"
-        " audio-to-audio live eval. A synthetic persona agent speaks with the"
-        " agent under test (implies --use_live)."
+        "Optional. Path to a JSON file with run-level voice settings"
+        " (VoiceProfile: voice_name, language_code, transport, audio_realism,"
+        " barge_in) applied uniformly to the run's audio cases. Voice/realism/"
+        "barge-in are run configuration, not eval-case data. When the file sets"
+        " 'transport' it takes precedence over --live_transport."
     ),
 )
 @click.option(
@@ -1045,8 +1270,8 @@ def eval_options():
     show_default=True,
     default=False,
     help=(
-        "Optional. With --persona, stream the live conversation to the console"
-        " as it unfolds."
+        "Optional. With an audio --live_transport, stream the live conversation"
+        " to the console as it unfolds."
     ),
 )
 @click.option(
@@ -1055,9 +1280,9 @@ def eval_options():
     show_default=True,
     default=False,
     help=(
-        "Optional. With --persona, also score with the managed Gen AI Eval"
-        " Service multi-turn metrics (requires a GCP project; slower). By"
-        " default only the local latency metric is used."
+        "Optional. With an audio --live_transport, also score with the managed"
+        " Gen AI Eval Service multi-turn metrics (requires a GCP project;"
+        " slower). By default only the local latency metric is used."
     ),
 )
 @click.option(
@@ -1066,17 +1291,32 @@ def eval_options():
     default=None,
     help="Optional. Per-turn timeout in seconds when running with --use_live.",
 )
+@click.option(
+    "--output_file",
+    type=str,
+    default=None,
+    help=(
+        "Optional. Write the aggregated eval results to this path as JSON. The"
+        " file contains a top-level summary plus the full EvalSetResult for"
+        " each eval set, intended for CI and programmatic (e.g. coding agent)"
+        " consumption."
+    ),
+)
 @eval_options()
+@click.pass_context
 def cli_eval(
+    ctx: click.Context,
     agent_module_file_path: str,
     eval_set_file_path_or_id: list[str],
     config_file_path: str,
     print_detailed_results: bool,
     use_live: bool = False,
-    persona_path: str | None = None,
+    live_transport: str = "text",
+    live_run_config_file: str | None = None,
     watch: bool = False,
     managed_metrics: bool = False,
     live_timeout_seconds: int | None = None,
+    output_file: str | None = None,
     eval_storage_uri: str | None = None,
     log_level: str = "INFO",
 ):
@@ -1163,24 +1403,35 @@ def cli_eval(
   except ModuleNotFoundError as mnf:
     raise click.ClickException(MISSING_EVAL_DEPENDENCIES_MESSAGE) from mnf
 
+  from ..evaluation.simulation.voice_profile import LiveTransport
+  from ..evaluation.simulation.voice_profile import VoiceProfile
+
   eval_config = get_evaluation_criteria_or_default(config_file_path)
-  print(f"Using evaluation criteria: {eval_config}")
   eval_metrics = get_eval_metrics_from_config(eval_config)
+  _print_eval_criteria(eval_metrics)
 
-  live_persona_scenario = None
-  if persona_path:
-    from ..evaluation.simulation.live_conversation_scenario import LiveConversationScenario
+  # Run-level voice settings: a --live_run_config_file takes precedence over a
+  # voice_profile embedded in the eval config file.
+  voice_profile = eval_config.voice_profile
+  if live_run_config_file:
+    with open(live_run_config_file, "r") as f:
+      voice_profile = VoiceProfile.model_validate_json(f.read())
 
-    with open(persona_path, "r") as persona_file:
-      live_persona_scenario = LiveConversationScenario.model_validate_json(
-          persona_file.read()
-      )
-    use_live = True
+  # Transport is run configuration: the voice profile may pin it, otherwise the
+  # --live_transport flag is used.
+  transport = LiveTransport(live_transport)
+  if voice_profile is not None and voice_profile.transport is not None:
+    transport = voice_profile.transport
+  is_audio_transport = transport in (
+      LiveTransport.TTS,
+      LiveTransport.NATIVE_AUDIO,
+  )
 
-    # A persona run has no golden references, so reference-based metrics do not
-    # apply. Resolve the valid live metric set (defaulting to local latency, with
-    # managed multi-turn metrics opt-in, and filtering reference-based metrics
-    # out of any supplied config).
+  if is_audio_transport:
+    # An audio run scores the freshly generated conversation, so reference-based
+    # metrics do not apply. Resolve the valid live metric set (local latency by
+    # default, managed multi-turn metrics opt-in) and filter reference-based
+    # metrics out of any supplied config.
     eval_metrics = _resolve_live_eval_metrics(
         eval_metrics,
         config_file_path=config_file_path,
@@ -1189,23 +1440,21 @@ def cli_eval(
 
   inference_config_kwargs = {
       "use_live": use_live,
-      "live_persona_scenario": live_persona_scenario,
+      "live_transport": transport,
+      "voice_profile": voice_profile,
   }
   if live_timeout_seconds is not None:
     inference_config_kwargs["live_timeout_seconds"] = live_timeout_seconds
   inference_config = InferenceConfig(**inference_config_kwargs)
 
-  if watch and live_persona_scenario is not None:
-    persona = live_persona_scenario.persona
+  audio_progress_callback = None
+  if watch and is_audio_transport:
     click.secho(
-        f"\n🎙  Live persona eval: '{persona.id}' (voice: {persona.voice_name})"
-        f" speaking with the agent under test.\n   Goal: {persona.goal}\n",
+        f"\n🎙  Live eval over '{transport.value}' transport: a simulated user"
+        " speaks with the agent under test.\n",
         fg="cyan",
     )
-  elif watch:
-    click.secho(
-        "--watch has no effect without --persona; ignoring.", fg="yellow"
-    )
+    audio_progress_callback = _make_watch_progress_callback()
 
   root_agent = get_root_agent(agent_module_file_path)
   app_name = os.path.basename(agent_module_file_path)
@@ -1223,6 +1472,14 @@ def cli_eval(
     eval_set_results_manager = gcs_eval_managers.eval_set_results_manager
   else:
     eval_set_results_manager = LocalEvalSetResultsManager(agents_dir=agents_dir)
+
+  # Snapshot existing result ids so we can report the files written by this run.
+  try:
+    pre_run_result_ids = set(
+        eval_set_results_manager.list_eval_set_results(app_name)
+    )
+  except Exception:  # pylint: disable=broad-except
+    pre_run_result_ids = set()
 
   inference_requests = []
   eval_set_file_or_id_to_evals = parse_and_get_evals_to_run(
@@ -1286,25 +1543,30 @@ def cli_eval(
           )
       )
 
-  # A persona-driven live run does not need a pre-authored eval set: the
-  # conversation is generated fresh from the persona. If no eval set was
-  # provided, synthesize a single-case in-memory set so inference can run.
-  if live_persona_scenario is not None and not inference_requests:
-    from ..evaluation._eval_sets_manager_utils import get_or_create_persona_eval_shell
-    from ..evaluation.in_memory_eval_sets_manager import InMemoryEvalSetsManager
+  # Transport is run configuration, so whether this is an audio run is decided
+  # once by the resolved transport (above) rather than per case.
+  run_has_audio = is_audio_transport
 
-    eval_sets_manager = InMemoryEvalSetsManager()
-    synthetic_set_id, _ = get_or_create_persona_eval_shell(
-        eval_sets_manager,
-        app_name=app_name,
-        persona=live_persona_scenario.persona,
+  if watch and not run_has_audio:
+    click.secho(
+        "--watch has no effect without an audio --live_transport; ignoring.",
+        fg="yellow",
     )
-    inference_requests.append(
-        InferenceRequest(
-            app_name=app_name,
-            eval_set_id=synthetic_set_id,
-            inference_config=inference_config,
-        )
+
+  # Audio runs persist per-turn user/agent audio to the artifact service, and the
+  # eval result stores references (app/user/session/filename) to that audio. Use
+  # a durable, per-agent artifact service rooted at the same local agents dir the
+  # results are written to, so the audio remains fetchable after this process
+  # exits (e.g. for playback in `adk web`). Without it the default in-memory
+  # artifact service drops the audio on exit, leaving the persisted result's
+  # references dangling (404 on load). Only built for audio runs; text runs do
+  # not produce artifacts. GCS-backed eval storage manages its own artifacts.
+  artifact_service = None
+  if run_has_audio and not eval_storage_uri:
+    from .utils.service_factory import create_artifact_service_from_options
+
+    artifact_service = create_artifact_service_from_options(
+        base_dir=agents_dir,
     )
 
   user_simulator_provider = UserSimulatorProvider(
@@ -1334,8 +1596,10 @@ def cli_eval(
         root_agent=root_agent,
         eval_sets_manager=eval_sets_manager,
         eval_set_results_manager=eval_set_results_manager,
+        artifact_service=artifact_service,
         user_simulator_provider=user_simulator_provider,
         metric_evaluator_registry=metric_evaluator_registry,
+        audio_progress_callback=audio_progress_callback,
     )
 
     inference_results = asyncio.run(
@@ -1353,28 +1617,6 @@ def cli_eval(
   except ModuleNotFoundError as mnf:
     raise click.ClickException(MISSING_EVAL_DEPENDENCIES_MESSAGE) from mnf
 
-  click.echo(
-      "*********************************************************************"
-  )
-  eval_run_summary = {}
-
-  for eval_result in eval_results:
-    eval_result: EvalCaseResult
-
-    if eval_result.eval_set_id not in eval_run_summary:
-      eval_run_summary[eval_result.eval_set_id] = [0, 0]
-
-    if eval_result.final_eval_status == EvalStatus.PASSED:
-      eval_run_summary[eval_result.eval_set_id][0] += 1
-    else:
-      eval_run_summary[eval_result.eval_set_id][1] += 1
-  click.echo("Eval Run Summary")
-  for eval_set_id, pass_fail_count in eval_run_summary.items():
-    click.echo(
-        f"{eval_set_id}:\n  Tests passed: {pass_fail_count[0]}\n  Tests"
-        f" failed: {pass_fail_count[1]}"
-    )
-
   if print_detailed_results:
     for eval_result in eval_results:
       eval_result: EvalCaseResult
@@ -1382,6 +1624,33 @@ def cli_eval(
           "********************************************************************"
       )
       pretty_print_eval_result(eval_result)
+
+  _print_eval_run_summary(eval_results)
+
+  # Report the result files this run wrote, so devs and coding agents can find
+  # the persisted structured results without guessing timestamped filenames.
+  _report_written_result_files(
+      eval_set_results_manager=eval_set_results_manager,
+      app_name=app_name,
+      pre_run_result_ids=pre_run_result_ids,
+  )
+
+  if output_file:
+    _write_eval_output_file(
+        output_file=output_file,
+        app_name=app_name,
+        eval_results=eval_results,
+    )
+    click.secho(f"Wrote eval results JSON to: {output_file}", fg="cyan")
+
+  # Exit non-zero when any case did not pass, so CI and coding-agent loops can
+  # branch on success. NOT_EVALUATED is treated as non-passing for this purpose.
+  any_not_passed = any(
+      eval_result.final_eval_status != EvalStatus.PASSED
+      for eval_result in eval_results
+  )
+  if any_not_passed:
+    ctx.exit(1)
 
 
 @main.command("optimize", cls=HelpfulCommand)
@@ -1614,7 +1883,9 @@ def cli_add_eval_case(
       )
 
     for scenario in conversation_scenarios.scenarios:
-      scenario_str = json.dumps(scenario.model_dump(), sort_keys=True)
+      scenario_str = json.dumps(
+          scenario.model_dump(exclude_none=True), sort_keys=True
+      )
       eval_id = hashlib.sha256(scenario_str.encode("utf-8")).hexdigest()[:8]
       eval_case = EvalCase(
           eval_id=eval_id,
@@ -1687,10 +1958,8 @@ def cli_generate_eval_cases(
   """
   logs.setup_adk_logger(getattr(logging, log_level.upper()))
   try:
-    from ..evaluation._vertex_ai_scenario_generation_facade import ScenarioGenerator
+    from ..evaluation._scenario_generation_helper import generate_and_add_eval_cases
     from ..evaluation.conversation_scenarios import ConversationGenerationConfig
-    from ..evaluation.eval_case import EvalCase
-    from ..evaluation.eval_case import SessionInput
     from .cli_eval import get_eval_sets_manager
     from .cli_eval import get_root_agent
     from .utils.state import create_empty_state
@@ -1705,63 +1974,20 @@ def cli_generate_eval_cases(
     eval_sets_manager = get_eval_sets_manager(eval_storage_uri, agents_dir)
     root_agent = get_root_agent(agent_module_file_path)
 
-    # Try to create if it doesn't already exist.
-    if (
-        eval_sets_manager.get_eval_set(
-            app_name=app_name, eval_set_id=eval_set_id
-        )
-        is None
-    ):
-      eval_sets_manager.create_eval_set(
-          app_name=app_name, eval_set_id=eval_set_id
-      )
-      click.echo(f"Eval set '{eval_set_id}' created for app '{app_name}'.")
-    else:
-      click.echo(f"Eval set '{eval_set_id}' already exists.")
-
     with open(user_simulation_config_file, "r") as f:
       config = ConversationGenerationConfig.model_validate_json(f.read())
 
-    generator = ScenarioGenerator()
     click.echo("Generating scenarios utilizing Vertex AI Eval SDK...")
-    scenarios = generator.generate_scenarios(root_agent, config)
-
-    # TODO: Expose initial session state when simulation library
-    # supports it.
-    initial_session_state = create_empty_state(root_agent)
-
-    session_input = SessionInput(
-        app_name=app_name, user_id="test_user_id", state=initial_session_state
+    added_eval_ids = generate_and_add_eval_cases(
+        root_agent=root_agent,
+        config=config,
+        eval_sets_manager=eval_sets_manager,
+        app_name=app_name,
+        eval_set_id=eval_set_id,
+        initial_session_state=create_empty_state(root_agent),
     )
-
-    for scenario in scenarios:
-      scenario_str = json.dumps(scenario.model_dump(), sort_keys=True)
-      eval_id = hashlib.sha256(scenario_str.encode("utf-8")).hexdigest()[:8]
-      eval_case = EvalCase(
-          eval_id=eval_id,
-          conversation_scenario=scenario,
-          session_input=session_input,
-          creation_timestamp=datetime.now().timestamp(),
-      )
-
-      if (
-          eval_sets_manager.get_eval_case(
-              app_name=app_name, eval_set_id=eval_set_id, eval_case_id=eval_id
-          )
-          is None
-      ):
-        eval_sets_manager.add_eval_case(
-            app_name=app_name, eval_set_id=eval_set_id, eval_case=eval_case
-        )
-        click.echo(
-            f"Eval case '{eval_case.eval_id}' added to eval set"
-            f" '{eval_set_id}'."
-        )
-      else:
-        click.echo(
-            f"Eval case '{eval_case.eval_id}' already exists in eval set"
-            f" '{eval_set_id}', skipped adding."
-        )
+    for eval_id in added_eval_ids:
+      click.echo(f"Eval case '{eval_id}' added to eval set '{eval_set_id}'.")
   except Exception as e:
     raise click.ClickException(f"Failed to generate eval case(s): {e}") from e
 

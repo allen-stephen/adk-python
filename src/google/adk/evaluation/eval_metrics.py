@@ -73,6 +73,8 @@ class PrebuiltMetrics(Enum):
 
   RESPONSE_LATENCY_V1 = "response_latency_v1"
 
+  SPEAKING_RATE_V1 = "speaking_rate_v1"
+
 
 MetricName: TypeAlias = Union[str, PrebuiltMetrics]
 Threshold: TypeAlias = float

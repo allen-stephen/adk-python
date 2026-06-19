@@ -17,10 +17,14 @@
 from __future__ import annotations
 
 from google.adk.evaluation.eval_case import AudioReference
-from google.adk.evaluation.simulation.live_conversation_materializer import materialize_conversation
-from google.adk.evaluation.simulation.live_conversation_types import CapturedUtterance
-from google.adk.evaluation.simulation.live_conversation_types import ConversationTurn
-from google.adk.evaluation.simulation.live_conversation_types import LiveConversation
+from google.adk.evaluation.simulation.live_conversation_materializer import \
+    materialize_conversation
+from google.adk.evaluation.simulation.live_conversation_types import \
+    CapturedUtterance
+from google.adk.evaluation.simulation.live_conversation_types import \
+    ConversationTurn
+from google.adk.evaluation.simulation.live_conversation_types import \
+    LiveConversation
 from google.genai import types
 
 
@@ -64,6 +68,26 @@ def test_each_turn_becomes_an_invocation():
   assert len(invocations) == 2
   assert invocations[0].user_content.parts[0].text == "Hi, a burger please"
   assert invocations[0].final_response.parts[0].text == "Sure, anything else?"
+
+
+def test_was_interrupted_is_carried_onto_invocation():
+  """A barged-in SUT turn marks its invocation `was_interrupted`."""
+  turn = _turn(0, "Hi", "Sure, anyth")
+  turn.sut_utterance.was_interrupted = True
+  conversation = LiveConversation(turns=[turn])
+
+  invocations = materialize_conversation(conversation)
+
+  assert invocations[0].was_interrupted is True
+
+
+def test_was_interrupted_defaults_false():
+  """A normal turn yields an invocation that is not flagged interrupted."""
+  conversation = LiveConversation(turns=[_turn(0, "Hi", "Hello")])
+
+  invocations = materialize_conversation(conversation)
+
+  assert invocations[0].was_interrupted is False
 
 
 def test_app_details_are_carried_onto_invocations():
@@ -186,7 +210,8 @@ def test_managed_facade_receives_no_null_content_or_duplicate_text():
   of the managed payload, and the SUT transcript must appear exactly once (as
   the agent's final response), not duplicated as an intermediate event.
   """
-  from google.adk.evaluation.vertex_ai_eval_facade import _MultiTurnVertexiAiEvalFacade
+  from google.adk.evaluation.vertex_ai_eval_facade import \
+      _MultiTurnVertexiAiEvalFacade
 
   conversation = LiveConversation(turns=[_turn(0, "Hello", "Hi there friend")])
   invocations = materialize_conversation(conversation)
@@ -214,7 +239,8 @@ def test_materialized_conversation_maps_to_managed_facade():
   This is the seam that lets the GenAI Evaluation Service score audio-to-audio
   conversations without any new managed code.
   """
-  from google.adk.evaluation.vertex_ai_eval_facade import _MultiTurnVertexiAiEvalFacade
+  from google.adk.evaluation.vertex_ai_eval_facade import \
+      _MultiTurnVertexiAiEvalFacade
 
   tool_call = types.FunctionCall(name="add_item", args={"item": "burger"})
   conversation = LiveConversation(

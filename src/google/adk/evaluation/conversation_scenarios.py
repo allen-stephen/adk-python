@@ -100,8 +100,11 @@ class ConversationGenerationConfig(EvalBaseModel):
       ),
   )
   model_name: str = Field(
+      default="gemini-flash-latest",
       description=(
           "The name of the Gemini model to use for generating the scenarios"
-          " (e.g., 'gemini-2.5-flash')."
-      )
+          " (e.g., 'gemini-2.5-flash'). Defaults to 'gemini-flash-latest' and"
+          " is normally managed by the backend; callers (CLI/UI) need not"
+          " set it."
+      ),
   )

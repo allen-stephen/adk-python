@@ -1263,7 +1263,9 @@ def test_cli_eval_with_eval_set_file_path(
       [str(agent_path), str(eval_set_file)],
   )
 
-  assert result.exit_code == 0
+  # The empty conversation yields a NOT_EVALUATED case, which is non-passing, so
+  # the command exits non-zero (for CI / coding-agent loops).
+  assert result.exit_code == 1, (result.output, repr(result.exception))
   # Assert that we wrote eval set results
   eval_set_results_manager = LocalEvalSetResultsManager(
       agents_dir=str(tmp_path)
@@ -1302,7 +1304,9 @@ def test_cli_eval_with_eval_set_id(
       [str(agent_path), "test_eval_set_id:case1,case2"],
   )
 
-  assert result.exit_code == 0
+  # The empty conversations yield NOT_EVALUATED cases, which are non-passing, so
+  # the command exits non-zero (for CI / coding-agent loops).
+  assert result.exit_code == 1, (result.output, repr(result.exception))
   # Assert that we wrote eval set results
   eval_set_results_manager = LocalEvalSetResultsManager(
       agents_dir=str(tmp_path)
@@ -1311,6 +1315,214 @@ def test_cli_eval_with_eval_set_id(
       app_name=app_name
   )
   assert len(eval_set_results) == 1
+
+
+def _capture_local_eval_service_kwargs(monkeypatch):
+  """Patches LocalEvalService + result collection, returning captured kwargs.
+
+  The audio-vs-text artifact-service wiring is what we assert, so the real
+  inference/eval execution (which would hit a model) is short-circuited.
+  """
+  captured = {}
+
+  class _FakeEvalService:
+
+    def __init__(self, **kwargs):
+      captured.update(kwargs)
+
+  monkeypatch.setattr(
+      "google.adk.evaluation.local_eval_service.LocalEvalService",
+      _FakeEvalService,
+  )
+
+  async def _fake_collect_inferences(*, inference_requests, eval_service):
+    return []
+
+  async def _fake_collect_eval_results(
+      *, inference_results, eval_service, eval_metrics
+  ):
+    return []
+
+  monkeypatch.setattr(
+      "google.adk.cli.cli_eval._collect_inferences",
+      _fake_collect_inferences,
+  )
+  monkeypatch.setattr(
+      "google.adk.cli.cli_eval._collect_eval_results",
+      _fake_collect_eval_results,
+  )
+  return captured
+
+
+def test_cli_eval_audio_run_uses_durable_artifact_service(
+    mock_get_root_agent,
+    tmp_path,
+    monkeypatch,
+):
+  """An audio (--live_transport tts) run must persist audio durably.
+
+  The eval result stores artifact references to the per-turn audio; if the
+  artifact service is the default in-memory one, those bytes are dropped on
+  process exit and later playback 404s. The CLI must wire a durable, file-backed
+  artifact service for audio runs.
+  """
+  from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
+
+  app_name = "audio_app"
+  eval_set_id = "audio_set"
+  agent_path = tmp_path / app_name
+  agent_path.mkdir()
+  (agent_path / "__init__.py").touch()
+
+  eval_sets_manager = LocalEvalSetsManager(agents_dir=str(tmp_path))
+  eval_sets_manager.create_eval_set(app_name=app_name, eval_set_id=eval_set_id)
+  eval_sets_manager.add_eval_case(
+      app_name=app_name,
+      eval_set_id=eval_set_id,
+      eval_case=EvalCase(eval_id="case1", conversation=[]),
+  )
+
+  captured = _capture_local_eval_service_kwargs(monkeypatch)
+
+  result = CliRunner().invoke(
+      cli_tools_click.cli_eval,
+      [str(agent_path), f"{eval_set_id}:case1", "--live_transport", "tts"],
+  )
+
+  assert result.exit_code == 0, (result.output, repr(result.exception))
+  artifact_service = captured.get("artifact_service")
+  assert artifact_service is not None
+  assert not isinstance(artifact_service, InMemoryArtifactService)
+
+
+def test_cli_eval_text_run_does_not_build_artifact_service(
+    mock_get_root_agent,
+    tmp_path,
+    monkeypatch,
+):
+  """A text run produces no artifacts, so no artifact service is built.
+
+  LocalEvalService then defaults to its own in-memory service, which is fine for
+  reference-based text metrics.
+  """
+  app_name = "text_app"
+  eval_set_id = "text_set"
+  agent_path = tmp_path / app_name
+  agent_path.mkdir()
+  (agent_path / "__init__.py").touch()
+
+  eval_sets_manager = LocalEvalSetsManager(agents_dir=str(tmp_path))
+  eval_sets_manager.create_eval_set(app_name=app_name, eval_set_id=eval_set_id)
+  eval_sets_manager.add_eval_case(
+      app_name=app_name,
+      eval_set_id=eval_set_id,
+      eval_case=EvalCase(eval_id="case1", conversation=[]),
+  )
+
+  captured = _capture_local_eval_service_kwargs(monkeypatch)
+
+  result = CliRunner().invoke(
+      cli_tools_click.cli_eval,
+      [str(agent_path), f"{eval_set_id}:case1"],
+  )
+
+  assert result.exit_code == 0, (result.output, repr(result.exception))
+  assert captured.get("artifact_service") is None
+
+
+def _make_eval_case_result(eval_set_id, eval_id, status):
+  from google.adk.evaluation.eval_result import EvalCaseResult
+
+  return EvalCaseResult(
+      eval_set_id=eval_set_id,
+      eval_id=eval_id,
+      final_eval_status=status,
+      overall_eval_metric_results=[],
+      eval_metric_result_per_invocation=[],
+      session_id="s1",
+  )
+
+
+@pytest.mark.unmute_click
+def test_print_eval_run_summary_separates_buckets(capsys):
+  from google.adk.evaluation.evaluator import EvalStatus
+
+  results = [
+      _make_eval_case_result("set_a", "c1", EvalStatus.PASSED),
+      _make_eval_case_result("set_a", "c2", EvalStatus.FAILED),
+      _make_eval_case_result("set_a", "c3", EvalStatus.NOT_EVALUATED),
+      _make_eval_case_result("set_b", "c4", EvalStatus.PASSED),
+  ]
+
+  cli_tools_click._print_eval_run_summary(results)
+
+  out = capsys.readouterr().out
+  assert "Tests passed: 1" in out  # set_a passed
+  assert "Tests failed: 1" in out  # set_a failed
+  assert "Tests not evaluated: 1" in out  # set_a not evaluated, kept distinct
+  assert "Total: 2 passed, 1 failed, 1 not evaluated" in out
+
+
+def test_write_eval_output_file_envelope(tmp_path):
+  import json
+
+  from google.adk.evaluation.evaluator import EvalStatus
+
+  results = [
+      _make_eval_case_result("set_a", "c1", EvalStatus.PASSED),
+      _make_eval_case_result("set_a", "c2", EvalStatus.FAILED),
+  ]
+  output_file = tmp_path / "results.json"
+
+  cli_tools_click._write_eval_output_file(
+      output_file=str(output_file),
+      app_name="my_app",
+      eval_results=results,
+  )
+
+  envelope = json.loads(output_file.read_text())
+  assert envelope["summary"] == {
+      "passed": 1,
+      "failed": 1,
+      "not_evaluated": 0,
+      "per_eval_set": {"set_a": {"passed": 1, "failed": 1, "not_evaluated": 0}},
+  }
+  assert len(envelope["eval_set_results"]) == 1
+  assert envelope["eval_set_results"][0]["evalSetId"] == "set_a"
+  assert len(envelope["eval_set_results"][0]["evalCaseResults"]) == 2
+
+
+def test_cli_eval_output_file_written(
+    mock_load_eval_set_from_file,
+    mock_get_root_agent,
+    tmp_path,
+):
+  import json
+
+  agent_path = tmp_path / "my_agent"
+  agent_path.mkdir()
+  (agent_path / "__init__.py").touch()
+
+  eval_set_file = tmp_path / "my_evals.json"
+  eval_set_file.write_text("{}")
+
+  mock_load_eval_set_from_file.return_value = EvalSet(
+      eval_set_id="my_evals",
+      eval_cases=[EvalCase(eval_id="case1", conversation=[])],
+  )
+
+  output_file = tmp_path / "out.json"
+  result = CliRunner().invoke(
+      cli_tools_click.cli_eval,
+      [str(agent_path), str(eval_set_file), "--output_file", str(output_file)],
+  )
+
+  # NOT_EVALUATED case -> non-zero exit, but the output file is still written.
+  assert result.exit_code == 1, (result.output, repr(result.exception))
+  assert output_file.exists()
+  envelope = json.loads(output_file.read_text())
+  assert "summary" in envelope
+  assert "eval_set_results" in envelope
 
 
 def test_cli_create_eval_set(tmp_path: Path):
@@ -1380,7 +1592,9 @@ def test_cli_add_eval_case_with_session(tmp_path: Path):
     eval_set_data = json.load(f)
   assert len(eval_set_data["eval_cases"]) == 1
   eval_case = eval_set_data["eval_cases"][0]
-  assert eval_case["eval_id"] == "734909ff"
+  # The eval id is a stable sha256 of the scenario's non-null fields, so adding
+  # optional fields does not change it.
+  assert eval_case["eval_id"] == "0a1a5048"
   assert eval_case["session_input"]["app_name"] == "test_app_add_2"
 
 

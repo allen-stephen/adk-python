@@ -389,9 +389,9 @@ class EvaluationGenerator:
     """Generates inferences for a single user invocation in live mode.
 
     The simulated user turn is injected as text via `send_content`; the agent
-    responds with audio that is captured back as transcription. For true
-    audio-to-audio persona evaluation, see
-    `simulation.persona_live_conversation.PersonaLiveConversationRunner`.
+    responds with audio that is captured back as transcription. For carrying the
+    user turn as audio (synthesized speech or a native-audio persona), see
+    `simulation.user_turn_transport`.
     """
     yield Event(
         content=user_message,

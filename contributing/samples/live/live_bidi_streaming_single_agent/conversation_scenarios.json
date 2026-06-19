@@ -1,0 +1,14 @@
+{
+  "scenarios": [
+    {
+      "starting_prompt": "Hey, can you help me with some dice?",
+      "conversation_plan": "Ask the agent to roll a 20-sided die. After you get the result, ask the agent to check if it is prime.",
+      "user_persona": "NOVICE"
+    },
+    {
+      "starting_prompt": "Roll a 6-sided die for me.",
+      "conversation_plan": "Get the agent to roll a 6-sided die, then confirm with it that the number isn't prime. Be terse.",
+      "user_persona": "EXPERT"
+    }
+  ]
+}

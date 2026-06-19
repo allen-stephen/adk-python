@@ -22,13 +22,13 @@ def _names(metrics):
   return [m.metric_name for m in metrics]
 
 
-def test_default_no_config_uses_local_latency_only():
-  """With no config and no managed flag, only local latency is used."""
+def test_default_no_config_uses_local_acoustic_metrics():
+  """With no config and no managed flag, the local acoustic metrics are used."""
   resolved = _resolve_live_eval_metrics(
       [], config_file_path=None, managed_metrics=False
   )
 
-  assert _names(resolved) == ["response_latency_v1"]
+  assert _names(resolved) == ["response_latency_v1", "speaking_rate_v1"]
   # The default latency threshold matches the realistic native-audio value.
   assert resolved[0].threshold == 5.0
 
@@ -41,6 +41,7 @@ def test_default_no_config_with_managed_adds_managed_set():
 
   assert _names(resolved) == [
       "response_latency_v1",
+      "speaking_rate_v1",
       "multi_turn_task_success_v1",
       "multi_turn_trajectory_quality_v1",
       "safety_v1",
@@ -59,7 +60,7 @@ def test_default_block_ignores_supplied_metrics_when_no_config():
       prior, config_file_path=None, managed_metrics=False
   )
 
-  assert _names(resolved) == ["response_latency_v1"]
+  assert _names(resolved) == ["response_latency_v1", "speaking_rate_v1"]
 
 
 def test_config_path_filters_reference_based_metrics():
