@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -80,7 +81,9 @@ class ScenarioGenerator:
     Returns:
       A list of ADK ConversationScenario objects.
     """
-    agent_info = types.evals.AgentInfo.load_from_agent(agent=agent)
+    agent_info = types.evals.AgentInfo.load_from_agent(
+        agent=self._with_canonical_tools(agent)
+    )
 
     vertex_config = types.evals.UserScenarioGenerationConfig(
         count=config.count,
@@ -106,3 +109,31 @@ class ScenarioGenerator:
       )
 
     return scenarios
+
+  def _with_canonical_tools(
+      self, agent: base_agent.BaseAgent
+  ) -> base_agent.BaseAgent:
+    """Returns a copy of the agent whose tools are canonical `BaseTool`s.
+
+    The Vertex Eval SDK's `AgentInfo.load_from_agent` introspects each entry in
+    `agent.tools`. For a tool that exposes `_get_declaration()` it uses that
+    declaration; otherwise it falls back to naively parsing the callable's
+    signature, which fails on ADK-injected parameters (e.g. `tool_context`) it
+    cannot turn into a JSON schema.
+
+    ADK stores tools as declared (often bare callables) and only wraps them into
+    `FunctionTool`s lazily via `canonical_tools()`. Those wrappers expose
+    `_get_declaration()` (which strips injected params), so canonicalizing the
+    tools first lets the SDK take its declaration-based path and avoids the
+    parse error.
+
+    `canonical_tools()` is async and only defined on LLM agents; this runs in a
+    sync context with no running event loop (CLI, or the dev server's worker
+    thread), so it is resolved with `asyncio.run`. Agents without it are returned
+    unchanged.
+    """
+    canonical_tools = getattr(agent, "canonical_tools", None)
+    if not callable(canonical_tools):
+      return agent
+    resolved_tools = asyncio.run(canonical_tools())
+    return agent.model_copy(update={"tools": resolved_tools})

@@ -7,7 +7,84 @@
       "conversation_scenario": {
         "starting_prompt": "Hey, can you help me with some dice?",
         "conversation_plan": "Ask the agent to roll a 20-sided die. After you get the result, ask the agent to check if it is prime.",
-        "user_persona": "NOVICE"
+        "user_persona": {
+          "id": "NOVICE",
+          "description": "A Novice is trying to solve a problem they don't fully understand, and they rely heavily on the Agent for guidance. Novices are patient with the Agent's questions, but are unable to troubleshoot the Agent's mistakes. Novices are also unable to correct the Agent.",
+          "behaviors": [
+            {
+              "name": "Advance if the Agent succeeds",
+              "description": "The Generated User Response should stick to the Conversation Plan as much as possible. It may deviate in response to Agent requests. The User Simulator starts with high-level goals, expecting the Agent to ask for specific details.",
+              "behavior_instructions": [
+                "If the Agent succeeds, make the next request from the Conversation Plan.",
+                "Skip redundant requests already fulfilled by the Agent.",
+                "When making a request, state only the high-level goal you want to achieve next.",
+                "Do NOT provide any additional information related to the high-level goal. The Agent must ask for it."
+              ],
+              "violation_rubrics": [
+                "The Generated User Response repeats a high-level goal that was already completed in previous turns.",
+                "The Generated User Response provides details for a high-level goal that was already completed.",
+                "The Generated User Response invents a new goal not present in the Conversation Plan or in the Agent's messages.",
+                "The Generated User Response invents details (e.g., a made-up phone number or address) not provided in the Conversation Plan or in the Agent's messages.",
+                "The Generated User Response provides specific details for a high-level goal (email content, recipient address, phone numbers) BEFORE the Agent has explicitly asked for them.",
+                "The Generated User Response tries to accomplish more than one high-level task in a single turn."
+              ]
+            },
+            {
+              "name": "Do not correct the Agent",
+              "description": "The User Simulator should end the conversation when the Agent provides an illogical or incorrect statement.",
+              "behavior_instructions": [
+                "If the Agent made an illogical or incorrect statement, end the conversation with `{{ stop_signal }}`."
+              ],
+              "violation_rubrics": [
+                "The Agent makes a mistake or an assumption and the Generated User Response corrects the Agent."
+              ]
+            },
+            {
+              "name": "Answer all questions",
+              "description": "The User Simulator should address EVERY question that the Agent asked, e.g., if the Agent asks \"How is your day going?\", the User Simulator should respond.",
+              "behavior_instructions": [
+                "Only answer the Agent's questions using information from the Conversation Plan.",
+                "Do NOT provide any additional information the Agent did not explicitly ask for.",
+                "If you do not have the information requested by the Agent, inform the Agent. Do NOT make up information that is not in the Conversation Plan. Acknowledge you don't know the information."
+              ],
+              "violation_rubrics": [
+                "The Agent asked a question (or multiple questions), and the Generated User Response failed to address one or all of them.",
+                "The Agent asked for information NOT in the Conversation Plan, and the Generated User Response made up an answer instead of stating, e.g., \"I don't know\" or \"I don't have that info.\""
+              ]
+            },
+            {
+              "name": "End the conversation appropriately",
+              "description": " A conversation is considered completed if ANY of the following stop conditions are true:\n- The Agent has confirmed the completion of all the high-level goals in the Conversation Plan.\n- The Agent successfully transferred the User Simulator to a human/live agent.\n- The Agent failed.\nThe Agent fails if it is unable to execute an action (e.g., calls a function incorrectly) or fails to provide a response expected by the Conversation Plan. Asking a clarification question is not a failure.",
+              "behavior_instructions": [
+                "End the conversation when any of the stopping conditions are met; do NOT end prematurely.",
+                "When ending the conversation because the Agent has completed all the high-level goals, you must wait until the Agent has confirmed the completion of all the goals before ending.",
+                "Output `{{ stop_signal }}` as part of your response to indicate that the conversation with the Agent is over.",
+                "Pay attention to the last Agent message in the Conversation History. If the Agent message contains a failure, end the conversation."
+              ],
+              "violation_rubrics": [
+                "The conversation meets one of the stop conditions above, but the Generated User Response did not use `{{ stop_signal }}`.",
+                "The Generated User Response used `{{ stop_signal }}` but the conversation does not meet any of the stop conditions above.",
+                "On the first Agent failure, the Generated User Response continues the conversation without using `{{ stop_signal }}`.",
+                "After the first Agent failure, the Generated User Response tries to continue the conversation without using `{{ stop_signal }}`."
+              ]
+            },
+            {
+              "name": "Conversational tone",
+              "description": "The User Simulator sounds informal. NOTE: `{{ stop_signal }}` is appropriate language.",
+              "behavior_instructions": [
+                "The User Simulator should sound like a normal human having a casual conversation.",
+                "Avoid answers that are too formal in nature or employ overly polite phrases and expressions.",
+                "Avoid answers that lack natural conversational framing, for example, sterile or purely functional responses."
+              ],
+              "violation_rubrics": [
+                "The Generated User Response is sterile and purely functional (direct commands) with no natural conversational framing.",
+                "The Generated User Response is too formal in nature, employing overly polite phrases and expressions.",
+                "The Generated User Response is a \"wall of text\" where a simple sentence would suffice.",
+                "The tone of the Generated User Response is inconsist with previous user turns (if present)."
+              ]
+            }
+          ]
+        }
       },
       "creation_timestamp": 1781747878.713116
     },
@@ -17,15 +94,23 @@
         {
           "invocation_id": "turn_0",
           "user_content": {
-            "role": "user",
-            "parts": [{ "text": "Please roll a 20-sided die." }]
+            "parts": [
+              {
+                "text": "Please roll a 20-sided die."
+              }
+            ],
+            "role": "user"
           }
         },
         {
           "invocation_id": "turn_1",
           "user_content": {
-            "role": "user",
-            "parts": [{ "text": "Is that number prime?" }]
+            "parts": [
+              {
+                "text": "Is that number prime?"
+              }
+            ],
+            "role": "user"
           }
         }
       ],

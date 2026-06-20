@@ -63,7 +63,7 @@ from .simulation.user_simulator_provider import UserSimulatorProvider
 from .simulation.user_turn_transport import NativeAudioPersonaTransport
 from .simulation.user_turn_transport import ProgressCallback
 from .simulation.user_turn_transport import TtsUserTurnTransport
-from .simulation.voice_profile import LiveTransport
+from .simulation.voice_profile import AudioGeneration
 from .simulation.voice_profile import VoiceProfile
 
 logger = logging.getLogger('google_adk.' + __name__)
@@ -195,7 +195,6 @@ class LocalEvalService(BaseEvalService):
             eval_case=eval_case,
             root_agent=self._root_agent,
             use_live=inference_request.inference_config.use_live,
-            live_transport=inference_request.inference_config.live_transport,
             voice_profile=inference_request.inference_config.voice_profile,
             live_timeout_seconds=inference_request.inference_config.live_timeout_seconds,
         )
@@ -688,7 +687,6 @@ class LocalEvalService(BaseEvalService):
       eval_case: EvalCase,
       root_agent: BaseAgent,
       use_live: bool,
-      live_transport: LiveTransport,
       voice_profile: Optional[VoiceProfile],
       live_timeout_seconds: int,
   ) -> InferenceResult:
@@ -709,22 +707,20 @@ class LocalEvalService(BaseEvalService):
         else 'test_user_id'
     )
 
-    # Transport is run configuration: the run-level voice profile may pin it,
-    # otherwise the run-level live_transport is used.
-    effective_transport = self._resolve_transport(voice_profile, live_transport)
+    # Run mode is set by `use_live`. A live run is an *audio* run when a voice
+    # profile is supplied; the profile's `audio_generation` then selects TTS vs.
+    # native-audio. A live run without a voice profile is text-over-Live-API.
+    is_audio_run = use_live and voice_profile is not None
 
     try:
       with client_label_context(EVAL_CLIENT_LABEL):
-        if effective_transport in (
-            LiveTransport.TTS,
-            LiveTransport.NATIVE_AUDIO,
-        ):
+        if is_audio_run:
           inferences = await self._run_audio_transport(
               app_name=app_name,
               root_agent=root_agent,
               session_id=session_id,
               eval_case=eval_case,
-              transport=effective_transport,
+              audio_generation=self._resolve_audio_generation(voice_profile),
               voice_profile=voice_profile,
               user_id=user_id,
           )
@@ -772,13 +768,13 @@ class LocalEvalService(BaseEvalService):
       return inference_result
 
   @staticmethod
-  def _resolve_transport(
-      voice_profile: Optional[VoiceProfile], run_transport: LiveTransport
-  ) -> LiveTransport:
-    """Returns the transport for the run: voice-profile pin, else run-level."""
-    if voice_profile is not None and voice_profile.transport is not None:
-      return voice_profile.transport
-    return run_transport
+  def _resolve_audio_generation(
+      voice_profile: Optional[VoiceProfile],
+  ) -> AudioGeneration:
+    """Returns the audio-generation approach for the run (defaults to TTS)."""
+    if voice_profile is not None:
+      return voice_profile.audio_generation
+    return AudioGeneration.TTS
 
   async def _run_audio_transport(
       self,
@@ -787,7 +783,7 @@ class LocalEvalService(BaseEvalService):
       root_agent: BaseAgent,
       session_id: str,
       eval_case: EvalCase,
-      transport: LiveTransport,
+      audio_generation: AudioGeneration,
       voice_profile: Optional[VoiceProfile],
       user_id: str,
   ) -> list[Invocation]:
@@ -796,7 +792,7 @@ class LocalEvalService(BaseEvalService):
     voice_profile = voice_profile or VoiceProfile()
     user_simulator = self._user_simulator_provider.provide(eval_case)
 
-    if transport == LiveTransport.NATIVE_AUDIO:
+    if audio_generation == AudioGeneration.NATIVE_AUDIO:
       audio_transport = NativeAudioPersonaTransport(
           sut_agent=root_agent,
           app_name=app_name,

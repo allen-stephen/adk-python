@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The audio transport seam for live evaluation.
+"""The audio I/O seam for live evaluation.
 
 A `UserTurnTransport` carries a conversation produced by user simulation to the
 agent under test *as audio*, and captures the agent's spoken reply. It is the
@@ -20,7 +20,7 @@ only live-specific machinery: the conversation source (a fixed script via
 `StaticUserSimulator`, or a simulated user via `LlmBackedUserSimulator`) and the
 downstream materialization and scoring are all shared with non-live eval.
 
-Two transports are provided:
+Two audio-generation approaches are provided:
 
 * `TtsUserTurnTransport` — synthesizes each simulated user turn to audio with a
   TTS voice and streams it to the agent. Works with any simulator (including a
@@ -63,6 +63,7 @@ from .audio_utils import LIVE_INPUT_MIME_TYPE
 from .audio_utils import LIVE_OUTPUT_RATE_HZ
 from .audio_utils import parse_sample_rate
 from .audio_utils import to_live_input
+from .live_app_details import build_app_details
 from .live_conversation_types import CapturedUtterance
 from .live_conversation_types import ConversationTurn
 from .live_conversation_types import LiveConversation
@@ -556,6 +557,10 @@ class TtsUserTurnTransport(_BaseAudioTransport):
   ) -> LiveConversation:
     realism = build_audio_realism_transform(voice_profile.audio_realism)
     conversation = LiveConversation()
+    # Capture the agent-under-test's instruction + tool declarations so managed
+    # metrics can judge the trajectory with the same agent context the non-live
+    # path provides.
+    conversation.app_details = await build_app_details(self._sut_agent)
 
     sut_session = await self._session_service.create_session(
         app_name=self._app_name, user_id=self._user_id, session_id=session_id
@@ -792,6 +797,10 @@ class NativeAudioPersonaTransport(_BaseAudioTransport):
     )
     realism = build_audio_realism_transform(voice_profile.audio_realism)
     conversation = LiveConversation()
+    # Capture the agent-under-test's instruction + tool declarations so managed
+    # metrics can judge the trajectory with the same agent context the non-live
+    # path provides.
+    conversation.app_details = await build_app_details(self._sut_agent)
 
     sut_session = await self._session_service.create_session(
         app_name=self._app_name, user_id=self._user_id, session_id=session_id

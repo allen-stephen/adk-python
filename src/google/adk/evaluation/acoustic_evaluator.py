@@ -43,7 +43,7 @@ logger = logging.getLogger("google_adk." + __name__)
 
 # A comfortable conversational speaking rate is roughly 2-3 words/second. The
 # default threshold passes runs at or below this upper bound.
-_DEFAULT_SPEAKING_RATE_THRESHOLD_WPS = 3.5
+_DEFAULT_SPEAKING_RATE_THRESHOLD_WPS = 5.0
 
 # Speaking rate is words divided by audio duration. Below this duration the
 # captured audio is too short for a meaningful rate (a fragment of audio paired

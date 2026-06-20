@@ -405,6 +405,24 @@ class TestMultiTurnVertexAiEvalFacade:
     assert agent_configs["agent2"].instruction == "instructions2"
     assert agent_configs["agent3"].instruction == "instructions3"
 
+  def test_get_agent_details_without_app_details_is_empty(self):
+    """Invocations lacking app_details yield no agent context.
+
+    This is the condition that previously starved managed metrics on live runs
+    (the trajectory autorater received an empty agents map). It is now avoided
+    upstream by populating app_details during live capture, but the facade must
+    still degrade gracefully when app_details is absent.
+    """
+    invocations = [
+        Invocation(user_content=genai_types.Content(), app_details=None),
+    ]
+
+    agent_configs = _MultiTurnVertexiAiEvalFacade._get_agent_details(
+        invocations
+    )
+
+    assert agent_configs == {}
+
   def test_map_invocation_event_to_agent_event(self):
     invocation_event = InvocationEvent(
         author="test_author",

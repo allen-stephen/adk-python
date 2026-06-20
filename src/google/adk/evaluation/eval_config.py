@@ -30,7 +30,6 @@ from .eval_metrics import BaseCriterion
 from .eval_metrics import MetricInfo
 from .eval_metrics import Threshold
 from .simulation.user_simulator import BaseUserSimulatorConfig
-from .simulation.voice_profile import LiveTransport
 from .simulation.voice_profile import VoiceProfile
 
 logger = logging.getLogger("google_adk." + __name__)
@@ -148,26 +147,16 @@ Example:
       description="Config to be used by the user simulator.",
   )
 
-  live_transport: LiveTransport = Field(
-      default=LiveTransport.TEXT,
-      description=(
-          "How user turns are carried to the agent under test for this run:"
-          " 'text' (standard non-live path), 'tts' (synthesize each user turn"
-          " to audio against a live agent), or 'native_audio' (a native-audio"
-          " persona that hears and speaks). A convenience shortcut; if"
-          " voiceProfile.transport is set it takes precedence."
-      ),
-  )
-
   voice_profile: Optional[VoiceProfile] = Field(
       default=None,
       description=(
           "Run-level voice, realism, and barge-in settings applied to audio"
           " runs. An eval case is pure stimulus + intent; how the run is voiced"
-          " (voice, language, transport, background noise, speaking rate,"
-          " barge-in) is run configuration and lives here, applied uniformly"
-          " across the run's cases. When unset, audio runs use a default"
-          " voice profile."
+          " (voice, language, audio_generation, background noise, speaking"
+          " rate, barge-in) is run configuration and lives here, applied"
+          " uniformly across the run's cases. A live run (use_live=True) is an"
+          " audio run when this is supplied; audio_generation selects TTS vs."
+          " native-audio."
       ),
   )
 

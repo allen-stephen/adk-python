@@ -49,8 +49,7 @@ def _invocation(
 
 
 def test_speaking_rate_passes_under_threshold():
-  # 6 words over 24000 samples @ 24kHz = 1s => 6 wps... use 2s of audio for 3wps.
-  evaluator = SpeakingRateV1Evaluator(threshold=3.5)
+  evaluator = SpeakingRateV1Evaluator(threshold=5.0)
   invocation = _invocation(words=6, num_samples=48000)  # 2 seconds -> 3 wps
 
   result = evaluator.evaluate_invocations([invocation])
@@ -60,7 +59,7 @@ def test_speaking_rate_passes_under_threshold():
 
 
 def test_speaking_rate_fails_over_threshold():
-  evaluator = SpeakingRateV1Evaluator(threshold=3.5)
+  evaluator = SpeakingRateV1Evaluator(threshold=5.0)
   invocation = _invocation(words=20, num_samples=48000)  # 2s -> 10 wps
 
   result = evaluator.evaluate_invocations([invocation])

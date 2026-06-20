@@ -62,7 +62,6 @@ from ..evaluation.eval_metrics import EvalStatus
 from ..evaluation.eval_metrics import MetricInfo
 from ..evaluation.eval_result import EvalSetResult
 from ..evaluation.eval_set import EvalSet
-from ..evaluation.simulation.voice_profile import LiveTransport
 from ..evaluation.simulation.voice_profile import VoiceProfile
 from .api_server import ApiServer
 from .utils import common
@@ -108,16 +107,6 @@ class RunEvalRequest(common.BaseModel):
       description=(
           "Whether to run inference using the Live API (bidirectional"
           " streaming). Required for Live API models (e.g. gemini-*-live-*)."
-      ),
-  )
-  live_transport: LiveTransport = Field(
-      default=LiveTransport.TEXT,
-      description=(
-          "How user turns are carried to the agent under test: 'text', 'tts'"
-          " (synthesize each user turn to audio against a live agent), or"
-          " 'native_audio' (a native-audio persona that hears and speaks). A"
-          " convenience shortcut; if voice_profile.transport is set it takes"
-          " precedence."
       ),
   )
   voice_profile: Optional[VoiceProfile] = Field(
@@ -1208,25 +1197,14 @@ class DevServer(ApiServer):
             session_service=self.session_service,
             artifact_service=self.artifact_service,
         )
-        # The run is an audio run when either the run-level transport or the
-        # voice profile's transport selects an audio transport.
-        effective_transport = (
-            req.voice_profile.transport
-            if req.voice_profile is not None
-            and req.voice_profile.transport is not None
-            else req.live_transport
-        )
-        is_audio_transport = effective_transport in (
-            LiveTransport.TTS,
-            LiveTransport.NATIVE_AUDIO,
-        )
+        # Run mode is set by `use_live`; a live run is an audio run when a voice
+        # profile is supplied. The engine reads `audio_generation` from it.
         inference_request = InferenceRequest(
             app_name=app_name,
             eval_set_id=eval_set_id,
             eval_case_ids=eval_case_ids,
             inference_config=InferenceConfig(
-                use_live=req.use_live or is_audio_transport,
-                live_transport=req.live_transport,
+                use_live=req.use_live,
                 voice_profile=req.voice_profile,
             ),
         )

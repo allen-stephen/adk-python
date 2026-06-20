@@ -22,9 +22,23 @@ from google.adk.agents.base_agent import BaseAgent
 from google.adk.dependencies.vertexai import vertexai
 from google.adk.evaluation._vertex_ai_scenario_generation_facade import ScenarioGenerator
 from google.adk.evaluation.conversation_scenarios import ConversationGenerationConfig
+from google.adk.tools.tool_context import ToolContext
 import pytest
 
 vertexai_types = vertexai.types
+
+
+def _roll_die_with_tool_context(sides: int, tool_context: ToolContext) -> int:
+  """Rolls a die.
+
+  A tool with an ADK-injected `tool_context` parameter, defined at module scope
+  so its type hints resolve. Used to verify the SDK does not choke on the
+  injected param after tool canonicalization.
+
+  Args:
+    sides: The number of sides.
+  """
+  return sides
 
 
 class TestScenarioGenerator:
@@ -128,7 +142,13 @@ class TestScenarioGenerator:
 
     generator = ScenarioGenerator()
 
+    # An agent whose tools are canonicalized before SDK introspection (the SDK
+    # needs `_get_declaration()`-capable tools). The canonical agent copy is what
+    # must be passed to `load_from_agent`.
+    canonical_agent = mocker.Mock(spec=BaseAgent)
     mock_agent = mocker.Mock(spec=BaseAgent)
+    mock_agent.canonical_tools = mocker.AsyncMock(return_value=["canon_tool"])
+    mock_agent.model_copy.return_value = canonical_agent
     config = ConversationGenerationConfig(
         count=2,
         generation_instruction="Test generation",
@@ -143,8 +163,13 @@ class TestScenarioGenerator:
     assert scenarios[1].starting_prompt == "Bye"
     assert scenarios[1].conversation_plan == "Say bye"
 
+    # The agent is copied with its canonical tools, and that copy (not the raw
+    # agent) is handed to the SDK.
+    mock_agent.model_copy.assert_called_once_with(
+        update={"tools": ["canon_tool"]}
+    )
     mock_agent_info_cls.load_from_agent.assert_called_once_with(
-        agent=mock_agent
+        agent=canonical_agent
     )
 
     mock_generate.assert_called_once()
@@ -153,3 +178,76 @@ class TestScenarioGenerator:
     passed_config = kwargs["config"]
     assert passed_config.count == 2
     assert passed_config.generation_instruction == "Test generation"
+
+  def test_generate_scenarios_passes_through_agent_without_canonical_tools(
+      self, mocker
+  ):
+    """A non-LLM agent (no canonical_tools) is introspected as-is."""
+    mocker.patch.dict(
+        os.environ, {"GOOGLE_API_KEY": "test_api_key"}, clear=True
+    )
+    mock_client_cls = mocker.patch(
+        "google.adk.dependencies.vertexai.vertexai.Client"
+    )
+    mock_client = mock_client_cls.return_value
+    mock_agent_info_cls = mocker.patch(
+        "google.adk.dependencies.vertexai.vertexai.types.evals.AgentInfo"
+    )
+    mock_agent_info_cls.load_from_agent.return_value = "mock_agent_info"
+    mocker.patch.object(
+        mock_client.evals,
+        "generate_conversation_scenarios",
+        return_value=mocker.Mock(eval_cases=[]),
+    )
+
+    generator = ScenarioGenerator()
+
+    # A bare BaseAgent has no `canonical_tools`; it must be passed through
+    # unchanged (no model_copy).
+    agent = mocker.Mock(spec=BaseAgent)
+    del agent.canonical_tools
+
+    generator.generate_scenarios(agent, ConversationGenerationConfig(count=1))
+
+    mock_agent_info_cls.load_from_agent.assert_called_once_with(agent=agent)
+
+  def test_generate_scenarios_canonicalizes_tools_with_injected_params(
+      self, mocker
+  ):
+    """Regression: an agent whose tool has an ADK-injected param (e.g.
+    `tool_context`) must not break SDK agent introspection.
+
+    Raw callables with injected params cannot be parsed by the SDK's naive
+    function-declaration fallback. Canonicalizing the tools first lets the SDK
+    use `_get_declaration()`, which strips injected params. `load_from_agent`
+    runs for real here (it is local introspection) to prove no error is raised.
+    """
+    from google.adk.agents.llm_agent import Agent
+
+    mocker.patch.dict(
+        os.environ, {"GOOGLE_API_KEY": "test_api_key"}, clear=True
+    )
+    mock_client_cls = mocker.patch(
+        "google.adk.dependencies.vertexai.vertexai.Client"
+    )
+    mock_client = mock_client_cls.return_value
+    mocker.patch.object(
+        mock_client.evals,
+        "generate_conversation_scenarios",
+        return_value=mocker.Mock(eval_cases=[]),
+    )
+
+    agent = Agent(
+        model="gemini-2.5-flash",
+        name="roller",
+        tools=[_roll_die_with_tool_context],
+    )
+
+    generator = ScenarioGenerator()
+
+    # Must not raise the "Failed to parse the parameter tool_context" ValueError.
+    scenarios = generator.generate_scenarios(
+        agent, ConversationGenerationConfig(count=1)
+    )
+
+    assert scenarios == []

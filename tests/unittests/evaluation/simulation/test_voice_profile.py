@@ -22,8 +22,8 @@ from google.adk.evaluation.simulation.audio_realism import \
     build_audio_realism_transform
 from google.adk.evaluation.simulation.audio_realism import \
     NoOpAudioRealismTransform
+from google.adk.evaluation.simulation.voice_profile import AudioGeneration
 from google.adk.evaluation.simulation.voice_profile import AudioRealismConfig
-from google.adk.evaluation.simulation.voice_profile import LiveTransport
 from google.adk.evaluation.simulation.voice_profile import VoiceProfile
 import pytest
 
@@ -37,15 +37,15 @@ def test_voice_profile_defaults():
 
   assert profile.voice_name == "Aoede"
   assert profile.language_code == "en-US"
-  assert profile.transport is None
+  assert profile.audio_generation == AudioGeneration.TTS
   assert profile.audio_realism is None
   assert profile.barge_in is None
 
 
-def test_voice_profile_transport_override():
-  profile = VoiceProfile(transport=LiveTransport.NATIVE_AUDIO)
+def test_voice_profile_audio_generation_override():
+  profile = VoiceProfile(audio_generation=AudioGeneration.NATIVE_AUDIO)
 
-  assert profile.transport == LiveTransport.NATIVE_AUDIO
+  assert profile.audio_generation == AudioGeneration.NATIVE_AUDIO
 
 
 def test_build_transform_disabled_is_noop():

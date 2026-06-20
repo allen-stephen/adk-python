@@ -1359,7 +1359,7 @@ def test_cli_eval_audio_run_uses_durable_artifact_service(
     tmp_path,
     monkeypatch,
 ):
-  """An audio (--live_transport tts) run must persist audio durably.
+  """An audio (--use_live with a voice profile) run must persist audio durably.
 
   The eval result stores artifact references to the per-turn audio; if the
   artifact service is the default in-memory one, those bytes are dropped on
@@ -1382,11 +1382,20 @@ def test_cli_eval_audio_run_uses_durable_artifact_service(
       eval_case=EvalCase(eval_id="case1", conversation=[]),
   )
 
+  voice_profile_file = tmp_path / "live_run_config.json"
+  voice_profile_file.write_text('{"audio_generation": "tts"}')
+
   captured = _capture_local_eval_service_kwargs(monkeypatch)
 
   result = CliRunner().invoke(
       cli_tools_click.cli_eval,
-      [str(agent_path), f"{eval_set_id}:case1", "--live_transport", "tts"],
+      [
+          str(agent_path),
+          f"{eval_set_id}:case1",
+          "--use_live",
+          "--live_run_config_file",
+          str(voice_profile_file),
+      ],
   )
 
   assert result.exit_code == 0, (result.output, repr(result.exception))

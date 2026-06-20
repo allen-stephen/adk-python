@@ -49,7 +49,7 @@ from google.adk.evaluation.local_eval_service import _copy_eval_case_rubrics_to_
 from google.adk.evaluation.local_eval_service import _copy_invocation_rubrics_to_actual_invocations
 from google.adk.evaluation.local_eval_service import LocalEvalService
 from google.adk.evaluation.metric_evaluator_registry import DEFAULT_METRIC_EVALUATOR_REGISTRY
-from google.adk.evaluation.simulation.voice_profile import LiveTransport
+from google.adk.evaluation.simulation.voice_profile import AudioGeneration
 from google.adk.evaluation.simulation.voice_profile import VoiceProfile
 from google.adk.models.registry import LLMRegistry
 from google.genai import types as genai_types
@@ -474,7 +474,6 @@ async def test_perform_inference_with_case_ids(
       eval_case=eval_set.eval_cases[0],
       root_agent=dummy_agent,
       use_live=False,
-      live_transport=LiveTransport.TEXT,
       voice_profile=None,
       live_timeout_seconds=300,
   )
@@ -484,7 +483,6 @@ async def test_perform_inference_with_case_ids(
       eval_case=eval_set.eval_cases[2],
       root_agent=dummy_agent,
       use_live=False,
-      live_transport=LiveTransport.TEXT,
       voice_profile=None,
       live_timeout_seconds=300,
   )
@@ -529,20 +527,19 @@ async def test_perform_inference_with_use_live(
       eval_case=eval_set.eval_cases[0],
       root_agent=dummy_agent,
       use_live=True,
-      live_transport=LiveTransport.TEXT,
       voice_profile=None,
       live_timeout_seconds=600,
   )
 
 
 @pytest.mark.asyncio
-async def test_perform_inference_passes_live_transport(
+async def test_perform_inference_passes_use_live(
     eval_service,
     dummy_agent,
     mock_eval_sets_manager,
     mocker,
 ):
-  """The run-level live transport is forwarded to the per-item inference."""
+  """The run-level use_live flag is forwarded to the per-item inference."""
   eval_set = EvalSet(
       eval_set_id="test_eval_set",
       eval_cases=[
@@ -558,9 +555,7 @@ async def test_perform_inference_passes_live_transport(
   inference_request = InferenceRequest(
       app_name="test_app",
       eval_set_id="test_eval_set",
-      inference_config=InferenceConfig(
-          parallelism=1, live_transport=LiveTransport.TTS
-      ),
+      inference_config=InferenceConfig(parallelism=1, use_live=True),
   )
 
   async for _ in eval_service.perform_inference(inference_request):
@@ -571,8 +566,7 @@ async def test_perform_inference_passes_live_transport(
       eval_set_id="test_eval_set",
       eval_case=eval_set.eval_cases[0],
       root_agent=dummy_agent,
-      use_live=False,
-      live_transport=LiveTransport.TTS,
+      use_live=True,
       voice_profile=None,
       live_timeout_seconds=300,
   )
@@ -1172,7 +1166,6 @@ async def test_perform_inference_single_eval_item_live(
       eval_case=eval_case,
       root_agent=dummy_agent,
       use_live=True,
-      live_transport=LiveTransport.TEXT,
       voice_profile=None,
       live_timeout_seconds=600,
   )
@@ -1213,7 +1206,6 @@ async def test_perform_inference_single_eval_item_non_live(
       eval_case=eval_case,
       root_agent=dummy_agent,
       use_live=False,
-      live_transport=LiveTransport.TEXT,
       voice_profile=None,
       live_timeout_seconds=300,
   )
@@ -1229,27 +1221,49 @@ async def test_perform_inference_single_eval_item_non_live(
   )
 
 
-def test_resolve_transport_uses_run_level_default():
-  """With no voice profile, the run-level transport is used."""
+@pytest.mark.asyncio
+async def test_perform_inference_single_eval_item_audio(
+    eval_service, dummy_agent, mocker
+):
+  """A live run with a voice profile routes to the audio transport."""
+  eval_case = EvalCase(eval_id="case1", conversation=[], session_input=None)
+  mock_run_audio = mocker.patch.object(
+      eval_service, "_run_audio_transport", new=mocker.AsyncMock(return_value=[])
+  )
+
+  eval_service._session_id_supplier = mocker.MagicMock(
+      return_value="test_session_id"
+  )
+  voice_profile = VoiceProfile(audio_generation=AudioGeneration.NATIVE_AUDIO)
+
+  await eval_service._perform_inference_single_eval_item(
+      app_name="test_app",
+      eval_set_id="test_eval_set",
+      eval_case=eval_case,
+      root_agent=dummy_agent,
+      use_live=True,
+      voice_profile=voice_profile,
+      live_timeout_seconds=600,
+  )
+
+  mock_run_audio.assert_called_once()
   assert (
-      LocalEvalService._resolve_transport(None, LiveTransport.TTS)
-      == LiveTransport.TTS
+      mock_run_audio.call_args.kwargs["audio_generation"]
+      == AudioGeneration.NATIVE_AUDIO
   )
 
 
-def test_resolve_transport_voice_profile_pins_transport():
-  """A run-level voice profile's transport takes precedence."""
-  voice_profile = VoiceProfile(transport=LiveTransport.NATIVE_AUDIO)
+def test_resolve_audio_generation_defaults_to_tts():
+  """With no voice profile, audio generation defaults to TTS."""
   assert (
-      LocalEvalService._resolve_transport(voice_profile, LiveTransport.TEXT)
-      == LiveTransport.NATIVE_AUDIO
+      LocalEvalService._resolve_audio_generation(None) == AudioGeneration.TTS
   )
 
 
-def test_resolve_transport_voice_profile_without_transport_falls_back():
-  """A voice profile without a transport falls back to the run-level one."""
-  voice_profile = VoiceProfile(voice_name="Kore")
+def test_resolve_audio_generation_reads_voice_profile():
+  """The voice profile's audio_generation is used when present."""
+  voice_profile = VoiceProfile(audio_generation=AudioGeneration.NATIVE_AUDIO)
   assert (
-      LocalEvalService._resolve_transport(voice_profile, LiveTransport.TTS)
-      == LiveTransport.TTS
+      LocalEvalService._resolve_audio_generation(voice_profile)
+      == AudioGeneration.NATIVE_AUDIO
   )

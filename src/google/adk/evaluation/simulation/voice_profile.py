@@ -32,16 +32,12 @@ from ...utils.feature_decorator import experimental
 from ..common import EvalBaseModel
 
 
-class LiveTransport(enum.Enum):
-  """How a user turn is carried to the agent under test.
+class AudioGeneration(enum.Enum):
+  """How the simulated user's audio turns are produced for a live (audio) run.
 
-  This is the seam between *what* the user says (shared user simulation) and
-  *how* it reaches the agent (text vs. audio). It is selected per run on the
-  eval config and may be overridden per scenario via `VoiceProfile.transport`.
+  Only relevant when the run is live (`use_live=True`). Independent of run mode:
+  run mode is controlled by `use_live`; this controls audio synthesis.
   """
-
-  TEXT = "text"
-  """Text over the standard (HTTP) inference path. The default, non-live case."""
 
   TTS = "tts"
   """Synthesize each user turn to audio with a TTS voice, then stream it to the
@@ -50,18 +46,18 @@ class LiveTransport(enum.Enum):
 
   NATIVE_AUDIO = "native_audio"
   """Drive a native-audio persona agent that hears the agent's audio and replies
-  in kind. Supports true, reactive barge-in. Requires a simulated user (a
-  `ConversationScenario`), not a fixed script."""
+  in kind. Supports reactive barge-in. Requires a simulated user
+  (a `ConversationScenario`), not a fixed script."""
 
 
 @experimental
 class BargeInConfig(EvalBaseModel):
   """Configuration for the user interrupting (barging in on) the agent.
 
-  Over the TTS transport this drives *timed* barge-in (the user starts speaking
-  a configured amount into the agent's turn). Over the native-audio transport it
-  enables *reactive* barge-in, where the persona interrupts in response to what
-  it hears.
+  With TTS audio generation this drives *timed* barge-in (the user starts
+  speaking a configured amount into the agent's turn). With native-audio
+  generation it enables *reactive* barge-in, where the persona interrupts in
+  response to what it hears.
   """
 
   enabled: bool = Field(
@@ -165,11 +161,12 @@ class VoiceProfile(EvalBaseModel):
       description="BCP-47 language code the user speaks in.",
   )
 
-  transport: Optional[LiveTransport] = Field(
-      default=None,
+  audio_generation: AudioGeneration = Field(
+      default=AudioGeneration.TTS,
       description=(
-          "Optional per-scenario override of the run-level live transport. When"
-          " unset, the transport chosen in the eval config is used."
+          "How the simulated user's audio is produced for a live run: 'tts'"
+          " (synthesize each user turn) or 'native_audio' (a native-audio"
+          " persona that hears and speaks)."
       ),
   )
 

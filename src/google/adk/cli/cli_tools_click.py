@@ -76,8 +76,9 @@ _MANAGED_LIVE_METRIC_DEFAULTS = (
 _LIVE_LATENCY_THRESHOLD_SECONDS = 5.0
 
 # A comfortable conversational speaking rate is ~2-3 words/second; pass at or
-# below this upper bound.
-_LIVE_SPEAKING_RATE_THRESHOLD_WPS = 3.5
+# below this upper bound. Kept in sync with the acoustic evaluator's default
+# (_DEFAULT_SPEAKING_RATE_THRESHOLD_WPS) and the web UI's LOCAL_LIVE_METRICS.
+_LIVE_SPEAKING_RATE_THRESHOLD_WPS = 5.0
 
 _EVAL_RESULT_FILE_EXTENSION = ".evalset_result.json"
 
@@ -1238,19 +1239,6 @@ def eval_options():
     ),
 )
 @click.option(
-    "--live_transport",
-    type=click.Choice(["text", "tts", "native_audio"]),
-    default="text",
-    show_default=True,
-    help=(
-        "Optional. How user turns are carried to the agent under test. 'text'"
-        " runs the standard path; 'tts' synthesizes each user turn to audio"
-        " against a live agent (works with fixed scripts and simulated users);"
-        " 'native_audio' drives a native-audio persona that hears and speaks"
-        " (supports reactive barge-in)."
-    ),
-)
-@click.option(
     "--live_run_config_file",
     type=click.Path(
         exists=True, dir_okay=False, file_okay=True, resolve_path=True
@@ -1258,10 +1246,11 @@ def eval_options():
     default=None,
     help=(
         "Optional. Path to a JSON file with run-level voice settings"
-        " (VoiceProfile: voice_name, language_code, transport, audio_realism,"
-        " barge_in) applied uniformly to the run's audio cases. Voice/realism/"
-        "barge-in are run configuration, not eval-case data. When the file sets"
-        " 'transport' it takes precedence over --live_transport."
+        " (VoiceProfile: voice_name, language_code, audio_generation,"
+        " audio_realism, barge_in) applied uniformly to the run's audio cases."
+        " Voice/realism/barge-in are run configuration, not eval-case data."
+        " Supplying this with --use_live makes the run an audio run;"
+        " audio_generation selects 'tts' (default) or 'native_audio'."
     ),
 )
 @click.option(
@@ -1270,8 +1259,8 @@ def eval_options():
     show_default=True,
     default=False,
     help=(
-        "Optional. With an audio --live_transport, stream the live conversation"
-        " to the console as it unfolds."
+        "Optional. With --use_live and a voice profile, stream the live"
+        " conversation to the console as it unfolds."
     ),
 )
 @click.option(
@@ -1280,9 +1269,9 @@ def eval_options():
     show_default=True,
     default=False,
     help=(
-        "Optional. With an audio --live_transport, also score with the managed"
-        " Gen AI Eval Service multi-turn metrics (requires a GCP project;"
-        " slower). By default only the local latency metric is used."
+        "Optional. With --use_live and a voice profile, also score with the"
+        " managed Gen AI Eval Service multi-turn metrics (requires a GCP"
+        " project; slower). By default only the local latency metric is used."
     ),
 )
 @click.option(
@@ -1311,7 +1300,6 @@ def cli_eval(
     config_file_path: str,
     print_detailed_results: bool,
     use_live: bool = False,
-    live_transport: str = "text",
     live_run_config_file: str | None = None,
     watch: bool = False,
     managed_metrics: bool = False,
@@ -1403,7 +1391,6 @@ def cli_eval(
   except ModuleNotFoundError as mnf:
     raise click.ClickException(MISSING_EVAL_DEPENDENCIES_MESSAGE) from mnf
 
-  from ..evaluation.simulation.voice_profile import LiveTransport
   from ..evaluation.simulation.voice_profile import VoiceProfile
 
   eval_config = get_evaluation_criteria_or_default(config_file_path)
@@ -1417,17 +1404,11 @@ def cli_eval(
     with open(live_run_config_file, "r") as f:
       voice_profile = VoiceProfile.model_validate_json(f.read())
 
-  # Transport is run configuration: the voice profile may pin it, otherwise the
-  # --live_transport flag is used.
-  transport = LiveTransport(live_transport)
-  if voice_profile is not None and voice_profile.transport is not None:
-    transport = voice_profile.transport
-  is_audio_transport = transport in (
-      LiveTransport.TTS,
-      LiveTransport.NATIVE_AUDIO,
-  )
+  # Run mode is set by --use_live; a live run is an audio run when a voice
+  # profile is supplied. The profile's audio_generation selects TTS vs. native.
+  is_audio_run = use_live and voice_profile is not None
 
-  if is_audio_transport:
+  if is_audio_run:
     # An audio run scores the freshly generated conversation, so reference-based
     # metrics do not apply. Resolve the valid live metric set (local latency by
     # default, managed multi-turn metrics opt-in) and filter reference-based
@@ -1440,7 +1421,6 @@ def cli_eval(
 
   inference_config_kwargs = {
       "use_live": use_live,
-      "live_transport": transport,
       "voice_profile": voice_profile,
   }
   if live_timeout_seconds is not None:
@@ -1448,10 +1428,10 @@ def cli_eval(
   inference_config = InferenceConfig(**inference_config_kwargs)
 
   audio_progress_callback = None
-  if watch and is_audio_transport:
+  if watch and is_audio_run:
     click.secho(
-        f"\n🎙  Live eval over '{transport.value}' transport: a simulated user"
-        " speaks with the agent under test.\n",
+        "\n🎙  Live audio eval: a simulated user speaks with the agent under"
+        " test.\n",
         fg="cyan",
     )
     audio_progress_callback = _make_watch_progress_callback()
@@ -1543,13 +1523,13 @@ def cli_eval(
           )
       )
 
-  # Transport is run configuration, so whether this is an audio run is decided
-  # once by the resolved transport (above) rather than per case.
-  run_has_audio = is_audio_transport
+  # Whether this is an audio run is decided once (above) rather than per case.
+  run_has_audio = is_audio_run
 
   if watch and not run_has_audio:
     click.secho(
-        "--watch has no effect without an audio --live_transport; ignoring.",
+        "--watch has no effect without --use_live and a voice profile;"
+        " ignoring.",
         fg="yellow",
     )
 

@@ -1,7 +1,7 @@
 {
   "voice_name": "Aoede",
   "language_code": "en-US",
-  "transport": "native_audio",
+  "audio_generation": "native_audio",
   "barge_in": {
     "enabled": true,
     "probability": 0.3

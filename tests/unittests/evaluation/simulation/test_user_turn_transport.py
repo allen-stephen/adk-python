@@ -30,7 +30,7 @@ from google.adk.evaluation.simulation.live_conversation_types import \
     CapturedUtterance
 from google.adk.evaluation.simulation.static_user_simulator import \
     StaticUserSimulator
-from google.adk.evaluation.simulation.voice_profile import LiveTransport
+from google.adk.evaluation.simulation.voice_profile import AudioGeneration
 from google.adk.evaluation.simulation.voice_profile import VoiceProfile
 from google.genai import types as genai_types
 import pytest
@@ -129,7 +129,7 @@ async def test_tts_transport_runs_fixed_script_over_audio(monkeypatch):
   conversation = await transport.run(
       user_simulator=simulator,
       scenario=None,
-      voice_profile=VoiceProfile(transport=LiveTransport.TTS),
+      voice_profile=VoiceProfile(audio_generation=AudioGeneration.TTS),
       max_turns=5,
   )
 
@@ -187,7 +187,7 @@ async def test_tts_transport_barges_in_when_probability_fires(monkeypatch):
   conversation = await transport.run(
       user_simulator=simulator,
       scenario=None,
-      voice_profile=VoiceProfile(transport=LiveTransport.TTS),
+      voice_profile=VoiceProfile(audio_generation=AudioGeneration.TTS),
       max_turns=5,
       progress_callback=_progress,
   )
@@ -292,7 +292,7 @@ async def test_tts_transport_caps_barge_ins(monkeypatch):
       user_simulator=simulator,
       scenario=None,
       voice_profile=VoiceProfile(
-          transport=LiveTransport.TTS,
+          audio_generation=AudioGeneration.TTS,
           barge_in=BargeInConfig(
               enabled=True, probability=1.0, max_barge_ins=2
           ),
@@ -332,7 +332,7 @@ async def test_tts_transport_drains_and_threads_input_sent_time(monkeypatch):
   await transport.run(
       user_simulator=simulator,
       scenario=None,
-      voice_profile=VoiceProfile(transport=LiveTransport.TTS),
+      voice_profile=VoiceProfile(audio_generation=AudioGeneration.TTS),
       max_turns=3,
   )
 

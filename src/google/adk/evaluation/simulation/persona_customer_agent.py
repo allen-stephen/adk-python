@@ -14,7 +14,7 @@
 
 """Builds a native-audio Live agent that role-plays the simulated user.
 
-For the native-audio transport the simulated user is itself a Live agent: it
+For native-audio generation the simulated user is itself a Live agent: it
 hears the agent-under-test's audio and replies in kind. Its behavior is composed
 from the same `ConversationScenario` that drives the text user simulator (the
 starting prompt, the conversation plan, and the optional `UserPersona`), so the

@@ -45,13 +45,15 @@ To run `eval_set_1` over native audio with the voice settings in
 adk eval \
   path/to/live_bidi_streaming_single_agent \
   path/to/live_bidi_streaming_single_agent/eval_set_1.evalset.json \
+  --use_live \
   --live_run_config_file path/to/live_bidi_streaming_single_agent/live_run_config.json
 ```
 
-The `transport` in the run-config file selects the audio transport, so an
-explicit `--live_transport` flag is not required. Audio runs use reference-free
-live metrics (local latency by default; add `--managed_metrics` for the managed
-Gen AI Eval Service multi-turn metrics, which require a GCP project).
+`--use_live` runs the eval live, and supplying `--live_run_config_file` makes it
+an audio run. The `audio_generation` in the run-config file selects TTS
+(default) or native-audio. Audio runs use reference-free live metrics (local
+latency by default; add `--managed_metrics` for the managed Gen AI Eval Service
+multi-turn metrics, which require a GCP project).
 
 ## Usage Notes
 
