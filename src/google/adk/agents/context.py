@@ -194,6 +194,10 @@ class Context(ReadonlyContext):
     self._function_call_id = function_call_id
     self._tool_confirmation = tool_confirmation
 
+    # Whether this callback is running for a real live (bidi) model call. Set
+    # by the live model-call seam in the LLM flow; see the ``is_live`` property.
+    self._is_live_model_call = False
+
     # Workflow Execution
     self._node_path, self._run_id = _derive_node_path(
         node.name if node else None,
@@ -252,6 +256,29 @@ class Context(ReadonlyContext):
   @isolation_scope.setter
   def isolation_scope(self, value: str | None) -> None:
     self._isolation_scope = value
+
+  @property
+  def is_live(self) -> bool:
+    """Whether this callback is running for a live (bidi) model call.
+
+    ``True`` only when the framework's live model-call seam marked this call as
+    live (real ``run_live`` bidi streaming). ``False`` for ``run_async``, SSE,
+    and CFC turns (which internally use live machinery but are semantically
+    unary).
+
+    Callbacks (agent or plugin) can read this to branch on transport when
+    needed, e.g. to select a streaming screening API for live calls.
+    """
+    return self._is_live_model_call
+
+  @is_live.setter
+  def is_live(self, value: bool) -> None:
+    """Marks whether this callback is running for a live (bidi) model call.
+
+    Set by the framework's live model-call seam; not intended to be set by
+    user code.
+    """
+    self._is_live_model_call = value
 
   @property
   def tool_confirmation(self) -> ToolConfirmation | None:

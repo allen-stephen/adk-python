@@ -256,6 +256,60 @@ class InvocationContext(BaseModel):
   yields them to SSE.
   """
 
+  _live_callback_blocked_response: Optional[Any] = PrivateAttr(default=None)
+  """A pending live block from a before-model callback (an ``LlmResponse``).
+
+  In live (bidi) turns, a parallel input-screening task sets this when a
+  before-model callback (agent or plugin) returns a replacement response for
+  the user input. The receive loop polls it to stop the in-flight model
+  generation, surface the replacement response, and end the turn. Reset at the
+  end of each turn. Typed as ``Any`` to avoid importing ``LlmResponse`` into
+  the context module.
+  """
+
+  _live_callback_session_ended: bool = PrivateAttr(default=False)
+  """Whether a before/after-model callback intentionally ended the bidi session.
+
+  Set when the live seam closes the live request queue in response to a
+  callback returning a replacement (block) response. ``run_live`` reads it to
+  distinguish a deliberate, graceful session end from a real connection error,
+  so the resulting ``ConnectionClosed``/``APIError(1000)`` exits cleanly
+  instead of raising or attempting to reconnect.
+  """
+
+  _live_input_screen_tasks: list[asyncio.Task] = PrivateAttr(
+      default_factory=list
+  )
+  """Background parallel before-model-callback tasks for the current live turn.
+
+  Tracked so they can be awaited/cancelled during live teardown.
+  """
+
+  _live_voice_before_model_armed: bool = PrivateAttr(default=True)
+  """Whether the next voice (audio) activity should fire before-model callbacks.
+
+  In live (bidi) turns, typed input fires before-model callbacks via the
+  content path, but voice input streams as audio blobs with no pre-model text.
+  To still fire before-model callbacks once per spoken turn (observe-only;
+  voice cannot be blocked pre-model), the send loop fires them on the start of
+  a voice activity (``activity_start`` or the first audio blob of an activity)
+  and disarms this flag so subsequent chunks in the same activity do not
+  re-fire. It is re-armed at each turn boundary (send-side ``activity_end`` or
+  receive-side ``turn_complete``/``interrupted``) so the next spoken turn fires
+  once. The send and receive loops are concurrent asyncio tasks sharing this
+  flag; each check/disarm and re-arm is a non-awaiting critical section, so no
+  lock is required.
+  """
+
+  _live_llm_request: Optional[Any] = PrivateAttr(default=None)
+  """The base ``LlmRequest`` for the current live (bidi) connection.
+
+  Recorded by ``run_live`` so the live before-model callback seam can seed the
+  per-call request with the full model/config/tools, giving live callbacks the
+  same fidelity as non-live. Typed as ``Any`` to avoid importing ``LlmRequest``
+  into the context module.
+  """
+
   credential_by_key: dict[str, AuthCredential] = Field(default_factory=dict)
   """The resolved credentials for this invocation, keyed by credential_key."""
 

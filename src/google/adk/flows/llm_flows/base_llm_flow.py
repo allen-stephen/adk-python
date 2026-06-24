@@ -66,6 +66,119 @@ logger = logging.getLogger('google_adk.' + __name__)
 
 _ADK_AGENT_NAME_LABEL_KEY = 'adk_agent_name'
 
+
+def _live_input_callback_is_blocking(
+    invocation_context: InvocationContext,
+) -> bool:
+  """Whether any registered plugin requests pre-send (blocking) live input.
+
+  A plugin may opt into running its before-model callback on live input
+  *before* the input is forwarded to the model by exposing a truthy
+  ``live_input_blocking`` attribute. This keeps the flow generic — it does not
+  depend on any specific plugin type. Defaults to False (parallel,
+  latency-optimized).
+  """
+  plugin_manager = getattr(invocation_context, 'plugin_manager', None)
+  if not plugin_manager:
+    return False
+  for plugin in getattr(plugin_manager, 'plugins', []):
+    if getattr(plugin, 'live_input_blocking', False):
+      return True
+  return False
+
+
+def _live_output_text(llm_response: LlmResponse) -> Optional[str]:
+  """Extracts model output text from a live LlmResponse.
+
+  Prefers output transcription (the text rendering of audio output) and falls
+  back to model content text. Returns None for user/input or non-text chunks.
+  """
+  transcription = llm_response.output_transcription
+  if transcription and transcription.text:
+    return transcription.text
+  content = llm_response.content
+  if content and content.role != 'user' and content.parts:
+    texts = [part.text for part in content.parts if part.text]
+    if texts:
+      return ''.join(texts)
+  return None
+
+
+def _live_output_is_finished_transcription(llm_response: LlmResponse) -> bool:
+  """Whether a live LlmResponse is a consolidated (finished) output transcript.
+
+  The live connection yields output transcription twice over a turn:
+  incremental ``partial`` deltas, then a single ``finished`` response carrying
+  the full accumulated utterance. The output buffer must *replace* itself with
+  this authoritative text rather than append it, so the after-model callback
+  sees the utterance once instead of twice.
+  """
+  transcription = llm_response.output_transcription
+  return bool(transcription and transcription.finished and transcription.text)
+
+
+def _build_live_after_model_response(
+    last_output_response: Optional[LlmResponse],
+    buffered_text: str,
+) -> LlmResponse:
+  """Builds the full-fidelity LlmResponse for the live after-model callback.
+
+  Gives the after-model callback the same fidelity it has in non-live mode:
+  when the model emitted real content (text, audio, function calls), that
+  content is preserved. Output produced only as transcription (the text
+  rendering of audio) has no content parts, so a text content is synthesized
+  from the consolidated transcript instead. Either way, the callback sees the
+  consolidated turn output, screened once.
+  """
+  if (
+      last_output_response is not None
+      and last_output_response.content is not None
+      and last_output_response.content.parts
+  ):
+    response = last_output_response.model_copy(deep=True)
+    return response
+  return LlmResponse(
+      content=types.Content(
+          role='model',
+          parts=[types.Part(text=buffered_text)],
+      )
+  )
+
+
+def _live_input_transcription_text(llm_response: LlmResponse) -> Optional[str]:
+  """Extracts spoken-input text from a live LlmResponse.
+
+  Returns the consolidated user utterance only when the input transcription is
+  ``finished`` (the per-utterance boundary). Partial transcriptions return
+  ``None`` so input is processed once per utterance rather than per fragment.
+
+  Spoken input is transcribed *by the model*, so the transcription is itself a
+  product of a model invocation: it arrives on the receive side, in the model's
+  output stream, after the audio has already reached the model. It is therefore
+  screened through the *after*-model callback (which inspects model results),
+  not the before-model callback. This keeps ``before_model_callback`` a true
+  pre-model contract: only genuinely pre-model input (typed live input, and the
+  unary path) ever reaches it.
+  """
+  transcription = llm_response.input_transcription
+  if transcription and transcription.finished and transcription.text:
+    return transcription.text
+  return None
+
+
+def _build_live_input_transcription_response(text: str) -> LlmResponse:
+  """Builds the after-model LlmResponse carrying transcribed spoken input.
+
+  The ``input_transcription`` field is populated (and ``content``/
+  ``output_transcription`` left empty) so an after-model callback can recognize
+  this response as the user's transcribed utterance — a model result to screen
+  as *input* — and distinguish it from the model's own *output*.
+  """
+  return LlmResponse(
+      input_transcription=types.Transcription(text=text, finished=True)
+  )
+
+
 # Timing configuration
 DEFAULT_TRANSFER_AGENT_DELAY = 1.0
 DEFAULT_TASK_COMPLETION_DELAY = 1.0
@@ -197,6 +310,8 @@ async def _handle_before_model_callback(
     invocation_context: InvocationContext,
     llm_request: LlmRequest,
     model_response_event: Event,
+    *,
+    is_live_call: bool = False,
 ) -> Optional[LlmResponse]:
   """Runs before-model callbacks (plugins then agent callbacks).
 
@@ -204,6 +319,10 @@ async def _handle_before_model_callback(
     invocation_context: The invocation context.
     llm_request: The LLM request being built.
     model_response_event: The model response event for callback context.
+    is_live_call: Whether this model call is a real live (bidi) call. Conveyed
+      per-call on the callback context (``CallbackContext.is_live``) so
+      callbacks can branch on transport. CFC turns are not live and leave this
+      False.
 
   Returns:
     An LlmResponse if a callback short-circuits the LLM call, else None.
@@ -213,6 +332,8 @@ async def _handle_before_model_callback(
   callback_context = CallbackContext(
       invocation_context, event_actions=model_response_event.actions
   )
+  if is_live_call:
+    callback_context.is_live = True
 
   # First run callbacks from the plugins.
   callback_response = (
@@ -242,6 +363,8 @@ async def _handle_after_model_callback(
     invocation_context: InvocationContext,
     llm_response: LlmResponse,
     model_response_event: Event,
+    *,
+    is_live_call: bool = False,
 ) -> Optional[LlmResponse]:
   """Runs after-model callbacks (plugins then agent callbacks).
 
@@ -252,6 +375,10 @@ async def _handle_after_model_callback(
     invocation_context: The invocation context.
     llm_response: The LLM response to process.
     model_response_event: The model response event for callback context.
+    is_live_call: Whether this model call is a real live (bidi) call. Conveyed
+      per-call on the callback context (``CallbackContext.is_live``) so
+      callbacks can branch on transport. CFC turns are not live and leave this
+      False.
 
   Returns:
     An altered LlmResponse if a callback modifies it, else None.
@@ -284,6 +411,8 @@ async def _handle_after_model_callback(
   callback_context = CallbackContext(
       invocation_context, event_actions=model_response_event.actions
   )
+  if is_live_call:
+    callback_context.is_live = True
 
   # First run callbacks from the plugins.
   callback_response = (
@@ -538,6 +667,10 @@ class BaseLlmFlow(ABC):
     agent = invocation_context.agent
     llm_request.model = agent.canonical_live_model.model
 
+    # Record the base request so the live before-model callback seam can seed
+    # per-call requests with the full model/config/tools (non-live fidelity).
+    invocation_context._live_llm_request = llm_request
+
     llm = self.__get_llm(invocation_context)
     logger.debug(
         'Establishing live connection for agent: %s with llm request: %s',
@@ -722,7 +855,16 @@ class BaseLlmFlow(ABC):
               await send_task
             except asyncio.CancelledError:
               pass
+            # Clean up any parallel live before-model-callback tasks.
+            await self._cleanup_live_input_screen_tasks(invocation_context)
       except (ConnectionClosed, ConnectionClosedOK) as e:
+        # A before/after-model callback block intentionally closed the session:
+        # this connection close is expected, so end the live flow gracefully
+        # (no reconnect, no error) regardless of whether session resumption is
+        # configured.
+        if invocation_context._live_callback_session_ended:
+          logger.info('Live session ended by a model-callback block.')
+          return
         # If we have a session resumption handle, we attempt to reconnect.
         # This handle is updated dynamically during the session.
         if invocation_context.live_session_resumption_handle:
@@ -736,6 +878,11 @@ class BaseLlmFlow(ABC):
         logger.error('Connection closed: %s.', e)
         raise
       except errors.APIError as e:
+        # A model-callback block intentionally closed the session; the
+        # resulting close (typically code 1000) is expected, so exit gracefully.
+        if invocation_context._live_callback_session_ended:
+          logger.info('Live session ended by a model-callback block.')
+          return
         # Error code 1000, 1006 and 1011 indicates a recoverable connection drop.
         # In that case, we attempt to reconnect with session handle if available.
         if e.code in [1000, 1006, 1011]:
@@ -755,6 +902,191 @@ class BaseLlmFlow(ABC):
             'An unexpected error occurred in live flow: %s', e, exc_info=True
         )
         raise
+
+  def _build_live_before_model_request(
+      self,
+      invocation_context: InvocationContext,
+      content: types.Content,
+  ) -> LlmRequest:
+    """Builds the LlmRequest passed to before-model callbacks in live mode.
+
+    To give callbacks the same fidelity they have in non-live mode, the request
+    is seeded from the live turn's base request (model, config, system
+    instruction, tools) when available, with the current turn's content
+    appended. Falls back to a content-only request if no base request was
+    recorded.
+    """
+    base_request = invocation_context._live_llm_request
+    if base_request is not None:
+      llm_request = base_request.model_copy(deep=True)
+      if llm_request.contents is None:
+        llm_request.contents = []
+      llm_request.contents.append(content)
+      return llm_request
+    return LlmRequest(contents=[content])
+
+  async def _handle_live_before_model_callback(
+      self,
+      invocation_context: InvocationContext,
+      content: types.Content,
+  ) -> Optional[LlmResponse]:
+    """Runs before-model callbacks for live input (marked as a live call).
+
+    Reuses the unary callback machinery but marks the per-call callback context
+    as live (``CallbackContext.is_live``), so callbacks can branch on
+    transport. The request is seeded from the live turn's base request so
+    callbacks see the full model/config/tools, matching non-live fidelity.
+
+    Args:
+      invocation_context: The invocation context.
+      content: The user content being sent to the live model.
+
+    Returns:
+      An LlmResponse if a callback returns a replacement (block), else None.
+    """
+    llm_request = self._build_live_before_model_request(
+        invocation_context, content
+    )
+    model_response_event = Event(
+        id=Event.new_id(),
+        invocation_id=invocation_context.invocation_id,
+        author=invocation_context.agent.name,
+    )
+    return await _handle_before_model_callback(
+        invocation_context,
+        llm_request,
+        model_response_event,
+        is_live_call=True,
+    )
+
+  async def _fire_live_voice_before_model_callback(
+      self,
+      invocation_context: InvocationContext,
+  ) -> None:
+    """Fires before-model callbacks once at the start of a voice activity.
+
+    Voice (audio) input streams as blobs with no pre-model text, so the
+    content-path before-model seam never runs for spoken turns. To still fire
+    before-model callbacks once per spoken turn for observe-only use cases
+    (logging, metrics, request inspection), this runs the canonical before-model
+    callbacks (plugins then agent callbacks) with the seeded base request and no
+    user text. It is **observe-only**: any returned replacement is ignored,
+    because the audio is already streaming to the model and cannot be blocked
+    pre-model (spoken input is screened post-model on its transcription). Fires
+    on the send side, independent of the model's response. Exceptions are logged
+    and swallowed so the send loop is never disrupted.
+    """
+    # No user text for voice: seed the request from the base (model/config/
+    # tools) with an empty user content so callbacks see full fidelity minus the
+    # prompt text.
+    llm_request = self._build_live_before_model_request(
+        invocation_context,
+        types.Content(role='user', parts=[]),
+    )
+    model_response_event = Event(
+        id=Event.new_id(),
+        invocation_id=invocation_context.invocation_id,
+        author=invocation_context.agent.name,
+    )
+    try:
+      # Return value intentionally discarded: voice cannot be blocked pre-model.
+      await _handle_before_model_callback(
+          invocation_context,
+          llm_request,
+          model_response_event,
+          is_live_call=True,
+      )
+    except Exception:  # pylint: disable=broad-except
+      logger.exception('Live voice before-model callback failed.')
+
+  async def _handle_live_after_model_callback(
+      self,
+      invocation_context: InvocationContext,
+      llm_response: LlmResponse,
+      model_response_event: Event,
+  ) -> Optional[LlmResponse]:
+    """Runs after-model callbacks for live output (marked as a live call).
+
+    Args:
+      invocation_context: The invocation context.
+      llm_response: The consolidated model response for the turn.
+      model_response_event: The model response event for the callback context.
+
+    Returns:
+      An altered/replaced LlmResponse if a callback modifies it, else None.
+    """
+    return await _handle_after_model_callback(
+        invocation_context,
+        llm_response,
+        model_response_event,
+        is_live_call=True,
+    )
+
+  def _spawn_live_before_model_callback(
+      self,
+      invocation_context: InvocationContext,
+      content: types.Content,
+  ) -> None:
+    """Runs the before-model callback concurrently with forwarding live input.
+
+    Spawns a background task that runs the before-model callbacks (marked as a
+    live call). If a callback returns a replacement response, the task records
+    a pending block on the invocation context and appends the event; the
+    receive loop honors the signal by stopping generation.
+    """
+
+    async def _screen() -> None:
+      try:
+        blocked_response = await self._handle_live_before_model_callback(
+            invocation_context, content
+        )
+        if blocked_response is not None:
+          invocation_context._live_callback_blocked_response = blocked_response
+          await self._append_live_blocked_event(
+              invocation_context, blocked_response
+          )
+      except asyncio.CancelledError:
+        raise
+      except Exception:  # pylint: disable=broad-except
+        logger.exception('Live before-model callback failed.')
+
+    task = asyncio.create_task(_screen())
+    invocation_context._live_input_screen_tasks.append(task)
+
+  async def _cleanup_live_input_screen_tasks(
+      self,
+      invocation_context: InvocationContext,
+  ) -> None:
+    """Cancels and drains any pending parallel before-model-callback tasks."""
+    tasks = invocation_context._live_input_screen_tasks
+    if not tasks:
+      return
+    for task in tasks:
+      if not task.done():
+        task.cancel()
+    for task in tasks:
+      try:
+        await task
+      except (asyncio.CancelledError, Exception):  # pylint: disable=broad-except
+        pass
+    invocation_context._live_input_screen_tasks = []
+
+  async def _append_live_blocked_event(
+      self,
+      invocation_context: InvocationContext,
+      blocked_response: LlmResponse,
+  ) -> None:
+    """Appends a callback-block event to the session for a live turn."""
+    blocked_event = Event(
+        id=Event.new_id(),
+        invocation_id=invocation_context.invocation_id,
+        author=invocation_context.agent.name,
+        content=blocked_response.content,
+    )
+    await invocation_context.session_service.append_event(
+        session=invocation_context.session,
+        event=blocked_event,
+    )
 
   async def _send_to_model(
       self,
@@ -785,10 +1117,25 @@ class BaseLlmFlow(ABC):
         return
 
       if live_request.activity_start:
+        # Start of a voice activity (manual VAD): fire before-model callbacks
+        # once for this spoken turn (observe-only), then disarm so audio chunks
+        # in the same activity do not re-fire.
+        if invocation_context._live_voice_before_model_armed:
+          invocation_context._live_voice_before_model_armed = False
+          await self._fire_live_voice_before_model_callback(invocation_context)
         await llm_connection.send_realtime(types.ActivityStart())
       elif live_request.activity_end:
+        # End of a voice activity: re-arm so the next spoken turn fires once.
+        invocation_context._live_voice_before_model_armed = True
         await llm_connection.send_realtime(types.ActivityEnd())
       elif live_request.blob:
+        # First audio blob of a voice activity (automatic VAD, no activity_start
+        # on the send side): fire before-model callbacks once for this spoken
+        # turn (observe-only), then disarm so subsequent chunks do not re-fire.
+        # Re-armed at the turn boundary by the receive loop.
+        if invocation_context._live_voice_before_model_armed:
+          invocation_context._live_voice_before_model_armed = False
+          await self._fire_live_voice_before_model_callback(invocation_context)
         # Cache input audio chunks before flushing
         self.audio_cache_manager.cache_audio(
             invocation_context, live_request.blob, cache_type='input'
@@ -806,6 +1153,29 @@ class BaseLlmFlow(ABC):
         if not is_function_response:
           if not content.role:
             content.role = 'user'
+          # Live before-model callback seam. Two modes:
+          #
+          # - blocking: run the before-model callback BEFORE forwarding the
+          #   input to the model. A returned replacement response prevents the
+          #   model from ever seeing the input (no leading-output leak), at the
+          #   cost of one round-trip of latency per turn.
+          #
+          # - parallel (default, latency-optimized): forward the input to the
+          #   model immediately and run the callback concurrently. A returned
+          #   replacement sets a cross-task block signal that the receive loop
+          #   honors by stopping generation and suppressing output. Clean input
+          #   adds no latency.
+          if _live_input_callback_is_blocking(invocation_context):
+            blocked_response = await self._handle_live_before_model_callback(
+                invocation_context, content
+            )
+            if blocked_response is not None:
+              await self._append_live_blocked_event(
+                  invocation_context, blocked_response
+              )
+              continue
+          else:
+            self._spawn_live_before_model_callback(invocation_context, content)
           user_content_event = Event(
               id=Event.new_id(),
               invocation_id=invocation_context.invocation_id,
@@ -847,6 +1217,15 @@ class BaseLlmFlow(ABC):
       else:
         return invocation_context.agent.name
 
+    # Per-turn buffer accumulating model output text for the after-model
+    # callback (run the running buffer per-chunk to allow an early decision,
+    # plus a consolidated check at turn_complete). ``last_output_response``
+    # holds the most recent full model response so the callback receives a
+    # full-fidelity LlmResponse.
+    output_buffer: list[str] = []
+    output_blocked = False
+    last_output_response: Optional[LlmResponse] = None
+
     while True:
       async with Aclosing(llm_connection.receive()) as agen:
         async for llm_response in agen:
@@ -864,6 +1243,144 @@ class BaseLlmFlow(ABC):
             # We proactively raise ConnectionClosed to trigger the reconnection
             # logic in run_live, which will use the latest session handle.
             raise ConnectionClosed(None, None)
+
+          # A turn boundary (the model finished or the user interrupted) delimits
+          # the current spoken turn. Re-arm the voice before-model callback so
+          # the next voice activity fires it once. The firing itself happens on
+          # the send side (activity_start / first audio blob); this only resets
+          # the gate, so the before-model firing stays model-independent.
+          if llm_response.turn_complete or llm_response.interrupted:
+            invocation_context._live_voice_before_model_armed = True
+
+          # Live spoken-input after-model callback seam. Spoken input is
+          # transcribed *by the model*, so the transcription is itself a model
+          # result: it arrives here, on the receive side, after the audio has
+          # already reached the model. It is therefore screened through the
+          # *after*-model callback (which inspects model results) — keeping
+          # ``before_model_callback`` a true pre-model contract reserved for
+          # genuinely pre-model input (typed live input, and the unary path).
+          # The callback receives an LlmResponse with ``input_transcription``
+          # populated so it can recognize this as the user's utterance and
+          # screen it as input. A returned replacement sets the same cross-task
+          # block signal the typed parallel path uses; the poll below honors it
+          # by ending the turn and suppressing output. Only typed input can be
+          # blocked before the model sees it.
+          if not output_blocked:
+            spoken_input = _live_input_transcription_text(llm_response)
+            if spoken_input:
+              screen_event = Event(
+                  id=Event.new_id(),
+                  invocation_id=invocation_context.invocation_id,
+                  author='user',
+              )
+              blocked_response = await self._handle_live_after_model_callback(
+                  invocation_context,
+                  _build_live_input_transcription_response(spoken_input),
+                  screen_event,
+              )
+              if blocked_response is not None:
+                invocation_context._live_callback_blocked_response = (
+                    blocked_response
+                )
+
+          # Input block: a typed parallel before-model callback or a spoken
+          # after-model callback returned a replacement for the user input.
+          # Stop generation, suppress in-flight output, surface the replacement
+          # response, and end the turn.
+          if (
+              not output_blocked
+              and invocation_context._live_callback_blocked_response is not None
+          ):
+            output_blocked = True
+            input_block = invocation_context._live_callback_blocked_response
+            invocation_context._live_callback_blocked_response = None
+            blocked_event = Event(
+                id=Event.new_id(),
+                invocation_id=invocation_context.invocation_id,
+                author=invocation_context.agent.name,
+                content=input_block.content,
+            )
+            blocked_event.turn_complete = True
+            yield blocked_event
+            # A callback block ends the live session gracefully: surface the
+            # replacement reply (above) then close. Mark it so run_live treats
+            # the ensuing connection close as an intentional end, not an error.
+            invocation_context._live_callback_session_ended = True
+            if invocation_context.live_request_queue:
+              invocation_context.live_request_queue.close()
+            continue
+
+          # Live after-model callback seam.
+          if not output_blocked:
+            chunk_text = _live_output_text(llm_response)
+            # Track the most recent model response so the after-model callback
+            # receives a full-fidelity LlmResponse (text + audio + function
+            # calls), not a text-only reconstruction.
+            if llm_response.content is not None:
+              last_output_response = llm_response
+            # The connection emits incremental `partial` deltas plus a final
+            # `finished` transcription carrying the full accumulated utterance.
+            # Append deltas (per-chunk early call), but *replace* the buffer
+            # with the consolidated finished transcription so the utterance is
+            # processed once rather than twice.
+            if chunk_text:
+              if _live_output_is_finished_transcription(llm_response):
+                output_buffer = [chunk_text]
+              else:
+                output_buffer.append(chunk_text)
+            is_turn_complete = bool(llm_response.turn_complete)
+            # Run the after-model callback on each output chunk (early
+            # decision) and again at turn_complete (consolidated check). At
+            # turn completion, fire even without buffered text so non-text
+            # turns (function calls, audio-only) still reach the callback with
+            # full fidelity.
+            buffered = ''.join(output_buffer)
+            has_turn_content = (
+                is_turn_complete and last_output_response is not None
+            )
+            if buffered or has_turn_content:
+              if chunk_text or is_turn_complete:
+                screen_event = Event(
+                    id=Event.new_id(),
+                    invocation_id=invocation_context.invocation_id,
+                    author=invocation_context.agent.name,
+                )
+                callback_response = (
+                    await self._handle_live_after_model_callback(
+                        invocation_context,
+                        _build_live_after_model_response(
+                            last_output_response, buffered
+                        ),
+                        screen_event,
+                    )
+                )
+                if callback_response is not None:
+                  # Suppress the in-flight output, surface the replacement
+                  # event, and end the turn.
+                  output_blocked = True
+                  await self._append_live_blocked_event(
+                      invocation_context, callback_response
+                  )
+                  blocked_event = Event(
+                      id=Event.new_id(),
+                      invocation_id=invocation_context.invocation_id,
+                      author=invocation_context.agent.name,
+                      content=callback_response.content,
+                  )
+                  blocked_event.turn_complete = True
+                  yield blocked_event
+                  # Graceful callback-initiated session end (see input path).
+                  invocation_context._live_callback_session_ended = True
+                  if invocation_context.live_request_queue:
+                    invocation_context.live_request_queue.close()
+                  continue
+          if output_blocked:
+            # Drop any remaining in-flight output for this turn.
+            if llm_response.turn_complete:
+              output_buffer = []
+              output_blocked = False
+              last_output_response = None
+            continue
 
           model_response_event = Event(
               id=Event.new_id(),
@@ -900,6 +1417,13 @@ class BaseLlmFlow(ABC):
                 )
 
               yield event
+
+          # Reset the callback buffers/signals at the end of a normal turn.
+          if llm_response.turn_complete:
+            output_buffer = []
+            output_blocked = False
+            last_output_response = None
+            invocation_context._live_callback_blocked_response = None
       # Give opportunity for other tasks to run.
       await asyncio.sleep(0)
 

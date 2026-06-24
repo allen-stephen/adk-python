@@ -22,12 +22,14 @@ from .plugin_manager import PluginManager
 if TYPE_CHECKING:
   from .debug_logging_plugin import DebugLoggingPlugin
   from .logging_plugin import LoggingPlugin
+  from .model_armor_plugin import ModelArmorPlugin
   from .reflect_retry_tool_plugin import ReflectAndRetryToolPlugin
 
 __all__ = [
     'BasePlugin',
     'DebugLoggingPlugin',
     'LoggingPlugin',
+    'ModelArmorPlugin',
     'PluginManager',
     'ReflectAndRetryToolPlugin',
 ]
@@ -35,6 +37,7 @@ __all__ = [
 _LAZY_MEMBERS: dict[str, str] = {
     'DebugLoggingPlugin': 'debug_logging_plugin',
     'LoggingPlugin': 'logging_plugin',
+    'ModelArmorPlugin': 'model_armor_plugin',
     'ReflectAndRetryToolPlugin': 'reflect_retry_tool_plugin',
 }
 
