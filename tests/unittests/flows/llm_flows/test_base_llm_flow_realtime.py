@@ -19,6 +19,7 @@ from google.adk.agents.live_request_queue import LiveRequestQueue
 from google.adk.agents.llm_agent import Agent
 from google.adk.agents.run_config import RunConfig
 from google.adk.flows.llm_flows.base_llm_flow import BaseLlmFlow
+from google.adk.telemetry.live_turn_tracing import LiveTurnTracer
 from google.adk.models.llm_request import LlmRequest
 from google.genai import types
 import pytest
@@ -74,7 +75,11 @@ async def test_send_to_model_with_disabled_vad(test_blob, mock_llm_connection):
   invocation_context.live_request_queue.close()
 
   # Run _send_to_model
-  await flow._send_to_model(mock_llm_connection, invocation_context)
+  await flow._send_to_model(
+      mock_llm_connection,
+      invocation_context,
+      LiveTurnTracer(invocation_context),
+  )
 
   mock_llm_connection.send_realtime.assert_called_once_with(test_blob)
 
@@ -108,7 +113,11 @@ async def test_send_to_model_with_enabled_vad(test_blob, mock_llm_connection):
   invocation_context.live_request_queue.close()
 
   # Run _send_to_model
-  await flow._send_to_model(mock_llm_connection, invocation_context)
+  await flow._send_to_model(
+      mock_llm_connection,
+      invocation_context,
+      LiveTurnTracer(invocation_context),
+  )
 
   mock_llm_connection.send_realtime.assert_called_once_with(test_blob)
 
@@ -134,7 +143,11 @@ async def test_send_to_model_without_realtime_config(
   invocation_context.live_request_queue.close()
 
   # Run _send_to_model
-  await flow._send_to_model(mock_llm_connection, invocation_context)
+  await flow._send_to_model(
+      mock_llm_connection,
+      invocation_context,
+      LiveTurnTracer(invocation_context),
+  )
 
   mock_llm_connection.send_realtime.assert_called_once_with(test_blob)
 
@@ -167,7 +180,11 @@ async def test_send_to_model_with_none_automatic_activity_detection(
   invocation_context.live_request_queue.close()
 
   # Run _send_to_model
-  await flow._send_to_model(mock_llm_connection, invocation_context)
+  await flow._send_to_model(
+      mock_llm_connection,
+      invocation_context,
+      LiveTurnTracer(invocation_context),
+  )
 
   mock_llm_connection.send_realtime.assert_called_once_with(test_blob)
 
@@ -194,7 +211,11 @@ async def test_send_to_model_with_text_content(mock_llm_connection):
   invocation_context.live_request_queue.close()
 
   # Run _send_to_model
-  await flow._send_to_model(mock_llm_connection, invocation_context)
+  await flow._send_to_model(
+      mock_llm_connection,
+      invocation_context,
+      LiveTurnTracer(invocation_context),
+  )
 
   # Verify send_content was called instead of send_realtime
   mock_llm_connection._send_content.assert_called_once_with(
@@ -224,7 +245,11 @@ async def test_send_to_model_with_intermediate_text_content(
   )
   invocation_context.live_request_queue.close()
 
-  await flow._send_to_model(mock_llm_connection, invocation_context)
+  await flow._send_to_model(
+      mock_llm_connection,
+      invocation_context,
+      LiveTurnTracer(invocation_context),
+  )
 
   mock_llm_connection._send_content.assert_called_once_with(
       content, partial=True

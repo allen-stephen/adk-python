@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from abc import ABC
 import asyncio
+import contextlib
 import inspect
 import logging
 from typing import AsyncGenerator
@@ -24,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from google.adk.platform import time as platform_time
 from google.genai import types
+from opentelemetry import context as context_api
 from opentelemetry import trace
 from websockets.exceptions import ConnectionClosed
 from websockets.exceptions import ConnectionClosedOK
@@ -44,6 +46,7 @@ from ...models.google_llm import GoogleLLMVariant
 from ...models.llm_request import LlmRequest
 from ...models.llm_response import LlmResponse
 from ...telemetry import _instrumentation
+from ...telemetry.live_turn_tracing import LiveTurnTracer
 from ...telemetry.tracing import trace_call_llm
 from ...telemetry.tracing import trace_send_data
 from ...telemetry.tracing import tracer
@@ -548,6 +551,19 @@ class BaseLlmFlow(ABC):
     agent = invocation_context.agent
     llm_request.model = agent.canonical_live_model.model
 
+    # One turn tracer per live session: it reconstructs a per-turn span tree
+    # (with time-to-first-token, transcripts, and audio references) from the
+    # otherwise-flat bidirectional stream. Snapshot the current OTel context so
+    # each turn nests under this agent's span (the `invoke_agent` span opened by
+    # `base_agent.run_live`, or a workflow node span). Capturing it here — rather
+    # than relying on the implicit current span later — keeps parenting correct
+    # across the concurrent send/receive tasks and across multi-agent sessions
+    # (agent transfer, sequential/loop sub-agents), where each sub-agent's
+    # `run_live` establishes its own agent span.
+    live_turn_tracer = LiveTurnTracer(
+        invocation_context, parent_context=context_api.get_current()
+    )
+
     llm = self.__get_llm(invocation_context)
     logger.debug(
         'Establishing live connection for agent: %s with llm request: %s',
@@ -630,7 +646,9 @@ class BaseLlmFlow(ABC):
               )
 
           send_task = asyncio.create_task(
-              self._send_to_model(llm_connection, invocation_context)
+              self._send_to_model(
+                  llm_connection, invocation_context, live_turn_tracer
+              )
           )
 
           should_reconnect = False
@@ -641,6 +659,7 @@ class BaseLlmFlow(ABC):
                     event_id,
                     invocation_context,
                     llm_request,
+                    live_turn_tracer,
                 )
             ) as agen:
               async for event in agen:
@@ -727,6 +746,9 @@ class BaseLlmFlow(ABC):
               await send_task
             except asyncio.CancelledError:
               pass
+            # Close any turn span still open when this connection tears down
+            # (e.g. mid-turn drop, transfer, or task completion).
+            live_turn_tracer.close()
         if should_reconnect:
           continue
         break
@@ -768,6 +790,7 @@ class BaseLlmFlow(ABC):
       self,
       llm_connection: BaseLlmConnection,
       invocation_context: InvocationContext,
+      live_turn_tracer: LiveTurnTracer,
   ):
     """Sends data to model."""
     while True:
@@ -797,6 +820,13 @@ class BaseLlmFlow(ABC):
       elif live_request.activity_end:
         await llm_connection.send_realtime(types.ActivityEnd())
       elif live_request.blob:
+        # Arm the time-to-first-token timer on the first audio chunk of a turn.
+        if (
+            live_request.blob.mime_type
+            and live_request.blob.mime_type.startswith('audio/')
+        ):
+          live_turn_tracer.on_user_audio()
+
         # Cache input audio chunks before flushing
         self.audio_cache_manager.cache_audio(
             invocation_context, live_request.blob, cache_type='input'
@@ -834,6 +864,7 @@ class BaseLlmFlow(ABC):
       event_id: str,
       invocation_context: InvocationContext,
       llm_request: LlmRequest,
+      live_turn_tracer: LiveTurnTracer,
   ) -> AsyncGenerator[Event, None]:
     """Receive data from model and process events using BaseLlmConnection."""
 
@@ -879,37 +910,110 @@ class BaseLlmFlow(ABC):
               id=Event.new_id(),
               invocation_id=invocation_context.invocation_id,
               author=get_author_for_event(llm_response),
+              branch=invocation_context.branch,
           )
 
-          async with Aclosing(
-              self._postprocess_live(
-                  invocation_context,
-                  llm_request,
-                  llm_response,
-                  model_response_event,
-              )
-          ) as agen:
-            async for event in agen:
-              # Cache output audio chunks from model responses
-              # TODO: support video data
-              if (
-                  invocation_context.run_config.save_live_blob
-                  and event.content
-                  and event.content.parts
-                  and event.content.parts[0].inline_data
-                  and event.content.parts[0].inline_data.mime_type.startswith(
-                      'audio/'
-                  )
-              ):
-                audio_blob = types.Blob(
-                    data=event.content.parts[0].inline_data.data,
-                    mime_type=event.content.parts[0].inline_data.mime_type,
-                )
-                self.audio_cache_manager.cache_audio(
-                    invocation_context, audio_blob, cache_type='output'
-                )
+          # Live sessions stream many small audio/text chunks per turn. Rather
+          # than emitting a span per chunk, the turn tracer aggregates each
+          # turn's chunks into a `live_turn` span with `user` and `assistant`
+          # children (see LiveTurnTracer). A usage-only response carries no
+          # user-visible content but finalizes the turn's token counts.
+          # See https://github.com/google/adk-python/issues/2323.
+          is_usage_only = (
+              llm_response.usage_metadata is not None
+              and not llm_response.content
+              and not llm_response.input_transcription
+              and not llm_response.output_transcription
+              and not llm_response.turn_complete
+              and not llm_response.interrupted
+          )
+          has_model_output = bool(llm_response.content) or bool(
+              llm_response.output_transcription
+          )
 
-              yield event
+          if is_usage_only:
+            live_turn_tracer.on_usage(llm_response)
+
+          # Open (or reuse) the assistant span for substantive model output and
+          # run postprocessing within it, so any `execute_tool` spans created
+          # for tool calls nest under the assistant span.
+          assistant_span = (
+              live_turn_tracer.on_model_output(llm_response)
+              if has_model_output
+              else live_turn_tracer.assistant_span
+          )
+          with (
+              trace.use_span(assistant_span, end_on_exit=False)
+              if assistant_span is not None
+              else contextlib.nullcontext()
+          ):
+            async with Aclosing(
+                self._postprocess_live(
+                    invocation_context,
+                    llm_request,
+                    llm_response,
+                    model_response_event,
+                )
+            ) as agen:
+              async for event in agen:
+                # Cache output audio chunks from model responses
+                # TODO: support video data
+                if (
+                    invocation_context.run_config.save_live_blob
+                    and event.content
+                    and event.content.parts
+                    and event.content.parts[0].inline_data
+                    and event.content.parts[0].inline_data.mime_type.startswith(
+                        'audio/'
+                    )
+                ):
+                  audio_blob = types.Blob(
+                      data=event.content.parts[0].inline_data.data,
+                      mime_type=event.content.parts[0].inline_data.mime_type,
+                  )
+                  self.audio_cache_manager.cache_audio(
+                      invocation_context, audio_blob, cache_type='output'
+                  )
+
+                # When audio is flushed to the artifact service, attach the
+                # resulting reference (not the bytes) to the user/assistant span.
+                if (
+                    event.content
+                    and event.content.parts
+                    and event.content.parts[0].file_data
+                    and event.content.parts[0].file_data.file_uri
+                ):
+                  file_uri = event.content.parts[0].file_data.file_uri
+                  is_input = event.author == 'user'
+                  live_turn_tracer.on_audio_reference(
+                      audio_ref=file_uri, is_input=is_input
+                  )
+
+                yield event
+
+          # Attach final transcripts to the user/assistant spans. Only the
+          # settled (finished) transcription carries the full utterance; partial
+          # deltas are skipped to avoid overwriting with fragments.
+          if (
+              llm_response.input_transcription
+              and llm_response.input_transcription.finished
+          ):
+            live_turn_tracer.on_input_transcript(
+                llm_response.input_transcription.text or ''
+            )
+          if (
+              llm_response.output_transcription
+              and llm_response.output_transcription.finished
+          ):
+            live_turn_tracer.on_output_transcript(
+                llm_response.output_transcription.text or ''
+            )
+
+          # Mark the turn pending finalize at natural boundaries. Spans stay
+          # open until the trailing usage arrives (or the next turn / session
+          # end), so the assistant span can carry accurate token counts.
+          if llm_response.turn_complete or llm_response.interrupted:
+            live_turn_tracer.on_turn_boundary(llm_response)
       # Give opportunity for other tasks to run.
       await asyncio.sleep(0)
 

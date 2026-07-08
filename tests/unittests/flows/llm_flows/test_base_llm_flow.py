@@ -1192,10 +1192,16 @@ async def test_receive_from_model_author_attribution():
 
   mock_connection.receive = mock.Mock(side_effect=mock_receive)
 
+  from google.adk.telemetry.live_turn_tracing import LiveTurnTracer
+
   events = []
   try:
     async for event in flow._receive_from_model(
-        mock_connection, 'event_id', invocation_context, LlmRequest()
+        mock_connection,
+        'event_id',
+        invocation_context,
+        LlmRequest(),
+        LiveTurnTracer(invocation_context),
     ):
       events.append(event)
   except StopTest:
@@ -1826,3 +1832,52 @@ async def test_postprocess_live_skips_none_function_response_event():
     ]
 
   assert all(event is not None for event in events)
+
+
+# --- Live receive loop behavior -------------------------------------------
+
+
+class _StopReceiveLoop(Exception):
+  """Sentinel used to break the infinite `_receive_from_model` loop in tests."""
+
+
+@pytest.mark.asyncio
+async def test_receive_from_model_stamps_branch_on_events():
+  """Live model events should carry the invocation branch, matching async."""
+  from google.adk.telemetry.live_turn_tracing import LiveTurnTracer
+
+  agent = Agent(name='test_agent')
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent
+  )
+  invocation_context.branch = 'parent.child'
+  flow = BaseLlmFlowForTesting()
+
+  content_response = LlmResponse(
+      content=types.Content(
+          role='model', parts=[types.Part.from_text(text='hi')]
+      )
+  )
+
+  async def mock_receive():
+    yield content_response
+    raise _StopReceiveLoop()
+
+  mock_connection = mock.AsyncMock()
+  mock_connection.receive = mock.Mock(side_effect=mock_receive)
+
+  events = []
+  try:
+    async for event in flow._receive_from_model(
+        mock_connection,
+        'seed_event_id',
+        invocation_context,
+        LlmRequest(),
+        LiveTurnTracer(invocation_context),
+    ):
+      events.append(event)
+  except _StopReceiveLoop:
+    pass
+
+  assert events
+  assert events[0].branch == 'parent.child'

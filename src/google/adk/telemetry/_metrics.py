@@ -90,6 +90,25 @@ _tool_execution_duration = meter.create_histogram(
         81.92,
     ],
 )
+_live_time_to_first_token = meter.create_histogram(
+    "gen_ai.live.time_to_first_token",
+    unit="s",
+    description=(
+        "Latency from the user's committed audio input to the first byte of"
+        " the model's response in a live (speech-to-speech) turn."
+    ),
+    explicit_bucket_boundaries_advisory=[
+        0.05,
+        0.1,
+        0.2,
+        0.4,
+        0.8,
+        1.6,
+        3.2,
+        6.4,
+        12.8,
+    ],
+)
 _client_operation_duration = (
     gen_ai_metrics.create_gen_ai_client_operation_duration(meter)
 )
@@ -177,6 +196,18 @@ def record_invoke_agent_tool_calls(agent_name: str, count: int) -> None:
   """Records the number of tool calls in an agent invocation."""
   attrs = {gen_ai_attributes.GEN_AI_AGENT_NAME: agent_name}
   _invoke_agent_tool_calls.record(count, attributes=attrs)
+
+
+def record_live_time_to_first_token(
+    agent_name: str,
+    model: str | None,
+    elapsed_s: float,
+):
+  """Records the live-turn time-to-first-token latency."""
+  attrs = {gen_ai_attributes.GEN_AI_AGENT_NAME: agent_name}
+  if model:
+    attrs[gen_ai_attributes.GEN_AI_REQUEST_MODEL] = model
+  _live_time_to_first_token.record(elapsed_s, attributes=attrs)
 
 
 def record_tool_execution_duration(

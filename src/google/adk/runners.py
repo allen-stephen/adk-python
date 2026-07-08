@@ -1581,45 +1581,50 @@ class Runner:
     from .agents.base_agent import BaseAgent
     from .workflow._base_node import BaseNode
 
-    if isinstance(self.agent, BaseNode) and not isinstance(
-        self.agent, BaseAgent
+    # Wrap the whole live session in the top-level invocation span so live
+    # sessions get the same root span as the non-live path (`run_async`).
+    with _instrumentation.record_invocation(
+        entrypoint_node=self.agent, conversation_id=session.id
     ):
+      if isinstance(self.agent, BaseNode) and not isinstance(
+          self.agent, BaseAgent
+      ):
+        async with aclosing(
+            self._run_node_live(
+                session=session,
+                live_request_queue=live_request_queue,
+                run_config=run_config,
+            )
+        ) as agen:
+          async for event in agen:
+            yield event
+        return
+      invocation_context = self._new_invocation_context_for_live(
+          session,
+          live_request_queue=live_request_queue,
+          run_config=run_config,
+      )
+
+      root_agent = self.agent
+      invocation_context.agent = self._find_agent_to_run(
+          invocation_context.session, root_agent
+      )
+
+      async def execute(ctx: InvocationContext) -> AsyncGenerator[Event]:
+        async with aclosing(ctx.agent.run_live(ctx)) as agen:
+          async for event in agen:
+            yield event
+
       async with aclosing(
-          self._run_node_live(
-              session=session,
-              live_request_queue=live_request_queue,
-              run_config=run_config,
+          self._exec_with_plugin(
+              invocation_context=invocation_context,
+              session=invocation_context.session,
+              execute_fn=execute,
+              is_live_call=True,
           )
       ) as agen:
         async for event in agen:
           yield event
-      return
-    invocation_context = self._new_invocation_context_for_live(
-        session,
-        live_request_queue=live_request_queue,
-        run_config=run_config,
-    )
-
-    root_agent = self.agent
-    invocation_context.agent = self._find_agent_to_run(
-        invocation_context.session, root_agent
-    )
-
-    async def execute(ctx: InvocationContext) -> AsyncGenerator[Event]:
-      async with aclosing(ctx.agent.run_live(ctx)) as agen:
-        async for event in agen:
-          yield event
-
-    async with aclosing(
-        self._exec_with_plugin(
-            invocation_context=invocation_context,
-            session=invocation_context.session,
-            execute_fn=execute,
-            is_live_call=True,
-        )
-    ) as agen:
-      async for event in agen:
-        yield event
 
   def _find_agent_to_run(
       self, session: Session, root_agent: BaseAgent

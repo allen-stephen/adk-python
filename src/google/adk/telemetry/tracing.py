@@ -42,6 +42,8 @@ from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_A
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_AGENT_NAME
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_CONVERSATION_ID
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_OPERATION_NAME
+from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_OUTPUT_TYPE
+from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_PROVIDER_NAME
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_REQUEST_MODEL
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_RESPONSE_FINISH_REASONS
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_SYSTEM
@@ -49,6 +51,8 @@ from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_A
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_TOOL_DESCRIPTION
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_TOOL_NAME
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_TOOL_TYPE
+from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GenAiOutputTypeValues
+from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GenAiProviderNameValues
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GenAiSystemValues
 from opentelemetry.semconv._incubating.attributes.user_attributes import USER_ID
 from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
@@ -84,6 +88,27 @@ ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS = "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"
 # this key in their BaseTool.custom_metadata will have the mapping added as a
 # span attribute
 GCP_MCP_SERVER_DESTINATION_ID = "gcp.mcp.server.destination.id"
+
+# OTel GenAI semconv attribute for the latency to the first streamed chunk of a
+# response (seconds). Hardcoded until it is exported by the pinned OTel version;
+# once available, replace with:
+# from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK
+GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK = "gen_ai.response.time_to_first_chunk"
+
+# Non-content pointers (artifact URIs) to a live turn's captured audio. No OTel
+# semconv attribute exists for these, so they live under the ADK `experimental`
+# namespace (mirroring `gen_ai.usage.experimental.*`); drop `.experimental.` if
+# and when OTel standardizes an equivalent.
+GEN_AI_INPUT_EXPERIMENTAL_AUDIO_REF = "gen_ai.input.experimental.audio_ref"
+GEN_AI_OUTPUT_EXPERIMENTAL_AUDIO_REF = "gen_ai.output.experimental.audio_ref"
+
+# `gen_ai.operation.name` values for live-session spans. `live_turn` is an
+# ADK-native aggregate operation (no OTel semconv operation describes a
+# speech-to-speech conversational turn); the assistant generation reuses the
+# semconv `generate_content` operation.
+GEN_AI_OPERATION_LIVE_TURN = "live_turn"
+GEN_AI_OPERATION_LIVE_USER = "live_turn.user"
+GEN_AI_OPERATION_GENERATE_CONTENT = "generate_content"
 
 # Silence unused warnings, but keep the public interface the same.
 _ = OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT
@@ -438,6 +463,119 @@ def trace_send_data(
     )
   else:
     span.set_attribute("gcp.vertex.agent.data", "{}")
+
+
+def _live_span_common_attributes(
+    invocation_context: InvocationContext, model: str | None
+) -> dict[str, AttributeValue]:
+  """Builds the provider/model/conversation attributes shared by live spans."""
+  attributes: dict[str, AttributeValue] = {
+      GEN_AI_PROVIDER_NAME: _guess_gemini_provider_name(),
+      GEN_AI_CONVERSATION_ID: invocation_context.session.id,
+  }
+  if model:
+    attributes[GEN_AI_REQUEST_MODEL] = model
+  return attributes
+
+
+def _transcript_messages_json(role: str, transcript: str) -> str:
+  """Serializes a transcript into an OTel GenAI messages-attribute payload."""
+  return safe_json_serialize(
+      [{"role": role, "parts": [{"type": "text", "content": transcript}]}]
+  )
+
+
+def set_live_turn_span_attributes(
+    span: Span,
+    invocation_context: InvocationContext,
+    *,
+    model: str | None = None,
+) -> None:
+  """Stamps operation/provider/model/agent attributes on the `live_turn` span.
+
+  The `live_turn` span is an ADK-native aggregate over a speech-to-speech turn
+  (one per conversational turn). It carries the agent name so multi-agent voice
+  sessions can be grouped or filtered by agent even in a flattened view.
+  """
+  span.set_attribute(GEN_AI_OPERATION_NAME, GEN_AI_OPERATION_LIVE_TURN)
+  span.set_attribute(GEN_AI_AGENT_NAME, invocation_context.agent.name)
+  span.set_attributes(_live_span_common_attributes(invocation_context, model))
+
+
+def set_live_user_span_attributes(
+    span: Span,
+    invocation_context: InvocationContext,
+    *,
+    transcript: str | None = None,
+    audio_ref: str | None = None,
+) -> None:
+  """Stamps input transcript / audio reference on the `user` span.
+
+  The transcript is user content, so it is emitted as a `gen_ai.input.messages`
+  attribute gated by the span content-capture switch. The audio reference is a
+  non-content pointer (artifact URI) and is recorded unconditionally when
+  supplied (the caller only supplies it when audio capture is enabled).
+  """
+  span.set_attribute(GEN_AI_OPERATION_NAME, GEN_AI_OPERATION_LIVE_USER)
+  span.set_attributes(_live_span_common_attributes(invocation_context, None))
+  if transcript:
+    telemetry_config = _telemetry_config_from_invocation_context(
+        invocation_context
+    )
+    if telemetry_config.should_add_content_to_experimental_spans:
+      span.set_attribute(
+          "gen_ai.input.messages",
+          _transcript_messages_json("user", transcript),
+      )
+  if audio_ref:
+    span.set_attribute(GEN_AI_INPUT_EXPERIMENTAL_AUDIO_REF, audio_ref)
+
+
+def set_live_assistant_span_attributes(
+    span: Span,
+    invocation_context: InvocationContext,
+    *,
+    model: str | None = None,
+    time_to_first_token_s: float | None = None,
+    transcript: str | None = None,
+    audio_ref: str | None = None,
+    usage_metadata: types.GenerateContentResponseUsageMetadata | None = None,
+    finish_reason: types.FinishReason | None = None,
+) -> None:
+  """Stamps model-response signals on the `assistant` span.
+
+  Records the voice signals that matter most for a spoken response: perceived
+  responsiveness (time-to-first-chunk), the model's transcript, a reference to
+  the captured audio, per-turn token usage (including the audio/video/text
+  breakdown), and the finish reason. The transcript is gated by the span
+  content-capture switch; the audio reference is a non-content pointer recorded
+  unconditionally when supplied.
+  """
+  span.set_attribute(GEN_AI_OPERATION_NAME, GEN_AI_OPERATION_GENERATE_CONTENT)
+  span.set_attribute(GEN_AI_OUTPUT_TYPE, GenAiOutputTypeValues.SPEECH.value)
+  span.set_attributes(_live_span_common_attributes(invocation_context, model))
+
+  if time_to_first_token_s is not None:
+    span.set_attribute(
+        GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK, time_to_first_token_s
+    )
+  if transcript:
+    telemetry_config = _telemetry_config_from_invocation_context(
+        invocation_context
+    )
+    if telemetry_config.should_add_content_to_experimental_spans:
+      span.set_attribute(
+          "gen_ai.output.messages",
+          _transcript_messages_json("assistant", transcript),
+      )
+  if audio_ref:
+    span.set_attribute(GEN_AI_OUTPUT_EXPERIMENTAL_AUDIO_REF, audio_ref)
+  if usage_metadata is not None:
+    _set_usage_metadata_attributes(span, usage_metadata)
+  if finish_reason is not None:
+    span.set_attribute(
+        GEN_AI_RESPONSE_FINISH_REASONS, [finish_reason.value.lower()]
+    )
 
 
 def _build_compaction_attributes(
@@ -892,4 +1030,13 @@ def _guess_gemini_system_name() -> str:
       GenAiSystemValues.VERTEX_AI.name.lower()
       if is_enterprise_mode_enabled()
       else GenAiSystemValues.GEMINI.name.lower()
+  )
+
+
+def _guess_gemini_provider_name() -> str:
+  """Returns the OTel `gen_ai.provider.name` value for the active backend."""
+  return (
+      GenAiProviderNameValues.GCP_VERTEX_AI.value
+      if is_enterprise_mode_enabled()
+      else GenAiProviderNameValues.GCP_GEMINI.value
   )

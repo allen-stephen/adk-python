@@ -17,8 +17,9 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
+from google.genai import types
+
 if TYPE_CHECKING:
-  from google.genai import types
   from opentelemetry.util.types import AttributeValue
 
 # Centralized OpenTelemetry Semantic Conventions
@@ -32,6 +33,45 @@ GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS = 'gen_ai.usage.cache_read.input_tokens'
 # Use the import symbol once the minimum OpenTelemetry SDK version is updated to 1.42.0
 # from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_USAGE_REASONING_OUTPUT_TOKENS
 GEN_AI_USAGE_REASONING_OUTPUT_TOKENS = 'gen_ai.usage.reasoning.output_tokens'
+
+# Per-modality token breakdowns are not yet part of the stable/incubating OTel
+# gen_ai semantic conventions, so we emit them under the ADK `experimental`
+# namespace. These are especially useful for live (speech-to-speech) sessions
+# where audio (and video) tokens dominate cost and should be observable
+# separately from text tokens.
+GEN_AI_USAGE_INPUT_AUDIO_TOKENS = 'gen_ai.usage.experimental.input_audio_tokens'
+GEN_AI_USAGE_INPUT_TEXT_TOKENS = 'gen_ai.usage.experimental.input_text_tokens'
+GEN_AI_USAGE_INPUT_VIDEO_TOKENS = 'gen_ai.usage.experimental.input_video_tokens'
+GEN_AI_USAGE_OUTPUT_AUDIO_TOKENS = (
+    'gen_ai.usage.experimental.output_audio_tokens'
+)
+GEN_AI_USAGE_OUTPUT_TEXT_TOKENS = 'gen_ai.usage.experimental.output_text_tokens'
+GEN_AI_USAGE_OUTPUT_VIDEO_TOKENS = (
+    'gen_ai.usage.experimental.output_video_tokens'
+)
+
+
+def _modality_token_count(
+    details: list[types.ModalityTokenCount] | None,
+    modality: types.MediaModality,
+) -> int | None:
+  """Sums the token count for a given modality across a details list.
+
+  Args:
+    details: The per-modality token count breakdown, or None.
+    modality: The modality to total (e.g. AUDIO, VIDEO, or TEXT).
+
+  Returns:
+    The summed token count for the modality, or None if the breakdown is
+    absent or contains no entries for the modality.
+  """
+  if not details:
+    return None
+  total = None
+  for entry in details:
+    if entry.modality == modality and entry.token_count is not None:
+      total = (total or 0) + entry.token_count
+  return total
 
 
 @dataclasses.dataclass
@@ -90,5 +130,49 @@ class TokenUsage:
         attrs['gen_ai.usage.experimental.system_instruction_tokens'] = (
             system_instruction_tokens
         )
+
+      # Per-modality (audio vs text) breakdowns. Present on Gemini Live
+      # responses; each is a subset of the corresponding input/output total.
+      input_audio_tokens = _modality_token_count(
+          self.usage_metadata.prompt_tokens_details,
+          types.MediaModality.AUDIO,
+      )
+      if input_audio_tokens is not None:
+        attrs[GEN_AI_USAGE_INPUT_AUDIO_TOKENS] = input_audio_tokens
+
+      input_text_tokens = _modality_token_count(
+          self.usage_metadata.prompt_tokens_details,
+          types.MediaModality.TEXT,
+      )
+      if input_text_tokens is not None:
+        attrs[GEN_AI_USAGE_INPUT_TEXT_TOKENS] = input_text_tokens
+
+      input_video_tokens = _modality_token_count(
+          self.usage_metadata.prompt_tokens_details,
+          types.MediaModality.VIDEO,
+      )
+      if input_video_tokens is not None:
+        attrs[GEN_AI_USAGE_INPUT_VIDEO_TOKENS] = input_video_tokens
+
+      output_audio_tokens = _modality_token_count(
+          self.usage_metadata.candidates_tokens_details,
+          types.MediaModality.AUDIO,
+      )
+      if output_audio_tokens is not None:
+        attrs[GEN_AI_USAGE_OUTPUT_AUDIO_TOKENS] = output_audio_tokens
+
+      output_text_tokens = _modality_token_count(
+          self.usage_metadata.candidates_tokens_details,
+          types.MediaModality.TEXT,
+      )
+      if output_text_tokens is not None:
+        attrs[GEN_AI_USAGE_OUTPUT_TEXT_TOKENS] = output_text_tokens
+
+      output_video_tokens = _modality_token_count(
+          self.usage_metadata.candidates_tokens_details,
+          types.MediaModality.VIDEO,
+      )
+      if output_video_tokens is not None:
+        attrs[GEN_AI_USAGE_OUTPUT_VIDEO_TOKENS] = output_video_tokens
 
     return attrs
