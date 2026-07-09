@@ -351,6 +351,35 @@ async def test_usage_after_turn_complete_lands_on_assistant_span():
 
 
 @pytest.mark.asyncio
+async def test_assistant_span_carries_event_id_for_correlation():
+  """The assistant span is stamped with the streamed event id + invocation id.
+
+  Tooling (e.g. the ADK web inspector) associates a span with the selected
+  event via `gcp.vertex.agent.event_id`, mirroring the non-live `call_llm` path.
+  """
+  agent = Agent(name='test_agent')
+  ctx = await testing_utils.create_invocation_context(agent=agent)
+  flow = BaseLlmFlowForTesting()
+
+  output_tx = LlmResponse(
+      output_transcription=types.Transcription(text='hello', finished=True)
+  )
+  conn = _mock_connection([output_tx, LlmResponse(turn_complete=True)])
+
+  events, exporter = await _drain_receive(flow, conn, ctx, LlmRequest())
+
+  assistant = _spans_named(exporter, 'assistant')[0]
+  # The stamped event id must match an event actually streamed to the client.
+  streamed_ids = {e.id for e in events}
+  assert 'gcp.vertex.agent.event_id' in assistant.attributes
+  assert assistant.attributes['gcp.vertex.agent.event_id'] in streamed_ids
+  assert (
+      assistant.attributes['gcp.vertex.agent.invocation_id']
+      == ctx.invocation_id
+  )
+
+
+@pytest.mark.asyncio
 async def test_ttft_recorded_on_assistant_span_after_user_audio():
   """TTFT is recorded on the assistant span when user audio precedes output."""
   agent = Agent(name='test_agent')
@@ -381,6 +410,33 @@ async def test_ttft_recorded_on_assistant_span_after_user_audio():
 
   assistant = _spans_named(exporter, 'assistant')[0]
   assert 'gen_ai.response.time_to_first_chunk' in assistant.attributes
+
+
+@pytest.mark.asyncio
+async def test_assistant_span_marks_duration_as_generation():
+  """The assistant span labels its duration as server-side generation time.
+
+  The backend cannot observe client-side audio playback, so the span duration
+  covers generation only. The `assistant_duration_kind` attribute makes this
+  explicit so consumers surface time-to-first-chunk as the headline latency and
+  do not misread the duration as end-to-end perceived latency.
+  """
+  agent = Agent(name='test_agent')
+  ctx = await testing_utils.create_invocation_context(agent=agent)
+
+  def drive(t):
+    t.on_user_audio()
+    t.on_model_output(_audio_chunk())
+    t.on_turn_boundary(LlmResponse(turn_complete=True))
+    t.on_usage(_usage_only())
+
+  exporter = _run_tracer(ctx, drive)
+
+  assistant = _spans_named(exporter, 'assistant')[0]
+  assert (
+      assistant.attributes['gcp.vertex.agent.live.assistant_duration_kind']
+      == 'generation'
+  )
 
 
 @pytest.mark.asyncio
@@ -665,8 +721,14 @@ async def test_assistant_span_duration_matches_response_length():
 
 
 @pytest.mark.asyncio
-async def test_late_input_transcript_falls_back_to_turn_span():
-  """An input transcript arriving after first model output lands on live_turn."""
+async def test_late_input_transcript_still_opens_user_span():
+  """An input transcript arriving after first model output opens a user span.
+
+  Transcription can settle slower than the first model output. The user turn
+  must still get a `user` span (not have the transcript merged into the turn
+  span), so trace consumers see a consistent user/assistant tree regardless of
+  transcription timing.
+  """
   agent = Agent(name='test_agent')
   ctx = await testing_utils.create_invocation_context(
       agent=agent,
@@ -691,14 +753,18 @@ async def test_late_input_transcript_falls_back_to_turn_span():
 
   _, exporter = await _drain_receive(flow, conn, ctx, LlmRequest())
 
-  live_turn = _spans_named(exporter, 'live_turn')[0]
+  # The late transcript lands on a user span, not the live_turn span.
+  user_spans = _spans_named(exporter, 'user')
+  assert len(user_spans) == 1
   assert (
-      _transcript_text(live_turn.attributes['gen_ai.input.messages'])
+      _transcript_text(user_spans[0].attributes['gen_ai.input.messages'])
       == 'late question'
   )
-  # The user span, if opened at all, must not carry the late transcript.
-  for user in _spans_named(exporter, 'user'):
-    assert 'gen_ai.input.messages' not in user.attributes
+  live_turn = _spans_named(exporter, 'live_turn')[0]
+  assert 'gen_ai.input.messages' not in live_turn.attributes
+  # The user span nests under the live_turn.
+  assert user_spans[0].parent is not None
+  assert user_spans[0].parent.span_id == live_turn.context.span_id
 
 
 # --- Tool round-trips within a single turn --------------------------------

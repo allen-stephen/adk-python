@@ -199,6 +199,10 @@ class LiveTurnTracer:
     self._turn_span: Span | None = None
     self._user_span: Span | None = None
     self._assistant_span: Span | None = None
+    # Id of the model-response event for the current assistant generation, used
+    # to correlate the assistant span with the event streamed to the client.
+    # Reset whenever a fresh assistant span opens.
+    self._assistant_event_id: str | None = None
     # Turn awaiting its trailing usage-only response before it can close.
     self._pending_finalize = False
     # Accumulators stamped onto the assistant span at finalize.
@@ -222,9 +226,14 @@ class LiveTurnTracer:
     self._turn_started_at_ns: int | None = None
     # Whether the user span has already been closed at first model output.
     self._user_span_closed = False
+    # Epoch-ns timestamp of the model's first output this turn. Marks the moment
+    # the user's turn ended, so a late-arriving input transcript can still open
+    # a `user` span bounded by [first user audio, first model output] rather than
+    # being merged into the turn span. None until the model responds.
+    self._first_model_output_ns: int | None = None
     # Whether the model has produced output this turn. Once true, the user's
-    # turn is over: late input transcripts/audio route to the turn span rather
-    # than (re)opening a user span.
+    # turn is over: a late input transcript opens a user span retroactively,
+    # bounded by the utterance window, instead of a still-open one.
     self._model_responded = False
     # Whether a tool round-trip is in progress this turn. The Live API ends a
     # generation (turn_complete) to call a tool, then generates again after the
@@ -257,12 +266,18 @@ class LiveTurnTracer:
     if self._turn_started_at_ns is None:
       self._turn_started_at_ns = time.time_ns()
 
-  def on_model_output(self, llm_response: LlmResponse) -> Span | None:
+  def on_model_output(
+      self, llm_response: LlmResponse, event_id: str | None = None
+  ) -> Span | None:
     """Ensures the turn is open, records TTFT, and accumulates turn signals.
 
     Args:
       llm_response: The model response for this chunk. Its usage metadata and
         finish reason (when present) are accumulated for the turn.
+      event_id: The id of the model-response event streamed to the client for
+        this chunk. The first non-empty id seen for the turn is stamped on the
+        assistant span at finalize so tooling can correlate the span with the
+        selected event (see ``set_live_assistant_span_attributes``).
 
     Returns:
       The open assistant span (so the caller can nest tool spans under it), or
@@ -270,6 +285,11 @@ class LiveTurnTracer:
     """
     if not self._enabled:
       return None
+    # Remember the first event id of this generation for span<->event
+    # correlation. Reset per assistant span so a tool-using turn's follow-up
+    # generation keys to its own event.
+    if event_id and self._assistant_event_id is None:
+      self._assistant_event_id = event_id
     # A new turn's output after a pending finalize means the trailing usage of
     # the previous turn never arrived; finalize it before starting the new one.
     if self._pending_finalize:
@@ -292,6 +312,8 @@ class LiveTurnTracer:
 
     # The user's turn ends when the model starts responding: close the user
     # span (if open) at first model output so its duration ~ utterance length.
+    if self._first_model_output_ns is None:
+      self._first_model_output_ns = now_ns
     if self._user_span is not None and not self._user_span_closed:
       self._user_span.end(end_time=now_ns)
       self._user_span_closed = True
@@ -334,26 +356,29 @@ class LiveTurnTracer:
     """Attaches the user's (final) input transcript to the user span.
 
     Input transcription usually arrives before the model starts responding, so
-    it lands on the (still-open) user span. If it arrives *after* the user span
-    has already closed at first model output, it falls back to the `live_turn`
-    span, since attributes cannot be added to an ended span.
+    it lands on the (still-open) user span. It can also arrive *after* the model
+    has begun responding (transcription settles slower than the first model
+    output); in that case the user span was never opened, so we open it
+    retroactively bounded by the utterance window ([first user audio, first
+    model output]) and close it immediately. Either way every user turn gets a
+    ``user`` span, independent of transcription timing.
     """
     if not self._enabled or not transcript:
       return
     if self._pending_finalize:
       self._finalize_turn()
     self._ensure_turn_span()
-    if self._model_responded:
-      # The user's turn is over (late transcript) — fall back to the turn span,
-      # since the user span has closed and attributes can't be added after end.
-      set_live_turn_span_attributes(
-          self._turn_span,
-          self._invocation_context,
-          model=self._model_name(),
-      )
+    if self._model_responded and self._user_span_closed:
+      # Late transcript with no open user span: create one retroactively so the
+      # turn still shows a `user` child. Bound it by the utterance window and
+      # close it right away (attributes can't be added after end).
+      user_span = self._ensure_user_span()
       set_live_user_span_attributes(
-          self._turn_span, self._invocation_context, transcript=transcript
+          user_span, self._invocation_context, transcript=transcript
       )
+      user_span.end(end_time=self._first_model_output_ns or time.time_ns())
+      # Mark closed so _finalize_turn does not attempt to end it again.
+      self._user_span_closed = True
     else:
       set_live_user_span_attributes(
           self._ensure_user_span(),
@@ -419,8 +444,14 @@ class LiveTurnTracer:
       self._fold_generation_usage()
       self._tool_call_pending = False
       if self._assistant_span is not None:
+        set_live_assistant_span_attributes(
+            self._assistant_span,
+            self._invocation_context,
+            event_id=self._assistant_event_id,
+        )
         self._assistant_span.end(end_time=time.time_ns())
         self._assistant_span = None
+        self._assistant_event_id = None
       return
 
     self._pending_finalize = True
@@ -512,9 +543,11 @@ class LiveTurnTracer:
           self._invocation_context,
           usage_metadata=self._usage_total,
           finish_reason=self._finish_reason,
+          event_id=self._assistant_event_id,
       )
       self._assistant_span.end(end_time=end_ns)
       self._assistant_span = None
+      self._assistant_event_id = None
     # The user span normally closes at first model output; close it here as a
     # fallback (e.g. a turn with user input but no model response).
     if self._user_span is not None and not self._user_span_closed:
@@ -525,6 +558,7 @@ class LiveTurnTracer:
       self._turn_span = None
 
     self._pending_finalize = False
+    self._assistant_event_id = None
     self._usage_total = None
     self._current_gen_usage = None
     self._finish_reason = None
@@ -532,6 +566,7 @@ class LiveTurnTracer:
     self._ttft_recorded = False
     self._turn_started_at_ns = None
     self._user_span_closed = False
+    self._first_model_output_ns = None
     self._model_responded = False
     self._tool_call_pending = False
 

@@ -938,7 +938,9 @@ class BaseLlmFlow(ABC):
           # run postprocessing within it, so any `execute_tool` spans created
           # for tool calls nest under the assistant span.
           assistant_span = (
-              live_turn_tracer.on_model_output(llm_response)
+              live_turn_tracer.on_model_output(
+                  llm_response, event_id=model_response_event.id
+              )
               if has_model_output
               else live_turn_tracer.assistant_span
           )

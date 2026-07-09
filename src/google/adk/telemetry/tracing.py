@@ -110,6 +110,16 @@ GEN_AI_OPERATION_LIVE_TURN = "live_turn"
 GEN_AI_OPERATION_LIVE_USER = "live_turn.user"
 GEN_AI_OPERATION_GENERATE_CONTENT = "generate_content"
 
+# ADK-native attribute describing what the live `assistant` span's wall-clock
+# duration measures. Value `generation` means [first model output chunk ->
+# turn_complete]; it deliberately excludes client-side audio playback, which the
+# backend cannot observe. Consumers should use `gen_ai.response.time_to_first_chunk`
+# as the headline responsiveness metric.
+GCP_VERTEX_AGENT_LIVE_ASSISTANT_DURATION_KIND = (
+    "gcp.vertex.agent.live.assistant_duration_kind"
+)
+LIVE_ASSISTANT_DURATION_KIND_GENERATION = "generation"
+
 # Silence unused warnings, but keep the public interface the same.
 _ = OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT
 _ = USER_CONTENT_ELIDED
@@ -541,6 +551,7 @@ def set_live_assistant_span_attributes(
     audio_ref: str | None = None,
     usage_metadata: types.GenerateContentResponseUsageMetadata | None = None,
     finish_reason: types.FinishReason | None = None,
+    event_id: str | None = None,
 ) -> None:
   """Stamps model-response signals on the `assistant` span.
 
@@ -550,10 +561,32 @@ def set_live_assistant_span_attributes(
   breakdown), and the finish reason. The transcript is gated by the span
   content-capture switch; the audio reference is a non-content pointer recorded
   unconditionally when supplied.
+
+  ``event_id`` (when supplied) is the id of the model-response event streamed to
+  the client for this turn. It is stamped as ``gcp.vertex.agent.event_id`` (with
+  the invocation id) so tooling — e.g. the ADK web inspector — can associate this
+  span with the event the user selected, mirroring the non-live ``call_llm``
+  path. These are ADK-native correlation attributes and do not affect the OTel
+  semconv signals above.
   """
   span.set_attribute(GEN_AI_OPERATION_NAME, GEN_AI_OPERATION_GENERATE_CONTENT)
   span.set_attribute(GEN_AI_OUTPUT_TYPE, GenAiOutputTypeValues.SPEECH.value)
   span.set_attributes(_live_span_common_attributes(invocation_context, model))
+  # The assistant span's wall-clock duration covers model generation/streaming
+  # (first output chunk -> turn_complete), NOT client-side audio playback: the
+  # backend cannot observe when the client finishes playing. Stamp the duration
+  # semantics explicitly so consumers (e.g. the ADK web inspector) surface
+  # time-to-first-token as the headline latency and label the span duration as
+  # generation time rather than implying it covers playback.
+  span.set_attribute(
+      GCP_VERTEX_AGENT_LIVE_ASSISTANT_DURATION_KIND,
+      LIVE_ASSISTANT_DURATION_KIND_GENERATION,
+  )
+  if event_id is not None:
+    span.set_attribute("gcp.vertex.agent.event_id", event_id)
+    span.set_attribute(
+        "gcp.vertex.agent.invocation_id", invocation_context.invocation_id
+    )
 
   if time_to_first_token_s is not None:
     span.set_attribute(
