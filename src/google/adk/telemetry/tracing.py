@@ -41,7 +41,9 @@ from opentelemetry._logs import LogRecord
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_AGENT_DESCRIPTION
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_AGENT_NAME
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_CONVERSATION_ID
+from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_INPUT_MESSAGES
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_OPERATION_NAME
+from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_OUTPUT_MESSAGES
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_OUTPUT_TYPE
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_PROVIDER_NAME
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_REQUEST_MODEL
@@ -64,10 +66,13 @@ from typing_extensions import deprecated
 from .. import version
 from ..utils.env_utils import is_enterprise_mode_enabled
 from ..utils.model_name_utils import is_gemini_model
+from ._experimental_semconv import _to_input_messages
 from ._experimental_semconv import maybe_log_completion_details
 from ._experimental_semconv import set_operation_details_attributes_from_request
 from ._experimental_semconv import set_operation_details_attributes_from_response
 from ._experimental_semconv import set_operation_details_common_attributes
+from ._experimental_semconv import transcript_to_content
+from ._experimental_semconv import transcript_to_output_messages
 from ._serialization import safe_json_serialize
 from ._stable_semconv import choice_body
 from ._stable_semconv import GEN_AI_CHOICE_EVENT
@@ -488,10 +493,29 @@ def _live_span_common_attributes(
   return attributes
 
 
-def _transcript_messages_json(role: str, transcript: str) -> str:
-  """Serializes a transcript into an OTel GenAI messages-attribute payload."""
+def _input_messages_json(transcript: str) -> str:
+  """Serializes a user transcript into a `gen_ai.input.messages` payload.
+
+  Reuses the non-live message serializer (`_to_input_messages`) so the string
+  stamped on the live `user` span matches the one emitted in the live turn's
+  `gen_ai.client.inference.operation.details` event byte-for-byte.
+  """
   return safe_json_serialize(
-      [{"role": role, "parts": [{"type": "text", "content": transcript}]}]
+      _to_input_messages([transcript_to_content("user", transcript)])
+  )
+
+
+def _output_messages_json(
+    transcript: str, finish_reason: types.FinishReason | None
+) -> str:
+  """Serializes a model transcript into a `gen_ai.output.messages` payload.
+
+  Reuses the shared output-message builder so the string stamped on the live
+  `assistant` span matches the one emitted in the live turn's
+  `gen_ai.client.inference.operation.details` event byte-for-byte.
+  """
+  return safe_json_serialize(
+      transcript_to_output_messages(transcript, finish_reason)
   )
 
 
@@ -534,8 +558,8 @@ def set_live_user_span_attributes(
     )
     if telemetry_config.should_add_content_to_experimental_spans:
       span.set_attribute(
-          "gen_ai.input.messages",
-          _transcript_messages_json("user", transcript),
+          GEN_AI_INPUT_MESSAGES,
+          _input_messages_json(transcript),
       )
   if audio_ref:
     span.set_attribute(GEN_AI_INPUT_EXPERIMENTAL_AUDIO_REF, audio_ref)
@@ -558,9 +582,16 @@ def set_live_assistant_span_attributes(
   Records the voice signals that matter most for a spoken response: perceived
   responsiveness (time-to-first-chunk), the model's transcript, a reference to
   the captured audio, per-turn token usage (including the audio/video/text
-  breakdown), and the finish reason. The transcript is gated by the span
-  content-capture switch; the audio reference is a non-content pointer recorded
-  unconditionally when supplied.
+  breakdown), and the finish reason. The audio reference is a non-content
+  pointer recorded unconditionally when supplied.
+
+  The transcript is stamped as ``gen_ai.output.messages`` for span
+  *visualization* (adk-web inspector), gated by the span content-capture switch
+  and symmetric with the ``user`` span's ``gen_ai.input.messages``. This is
+  independent of the per-turn ``gen_ai.client.inference.operation.details``
+  event (which additionally carries system instructions / tool definitions and
+  is gated on the experimental-semconv opt-in); both reuse the same shared
+  serializer, so the message payload is identical either way.
 
   ``event_id`` (when supplied) is the id of the model-response event streamed to
   the client for this turn. It is stamped as ``gcp.vertex.agent.event_id`` (with
@@ -598,8 +629,8 @@ def set_live_assistant_span_attributes(
     )
     if telemetry_config.should_add_content_to_experimental_spans:
       span.set_attribute(
-          "gen_ai.output.messages",
-          _transcript_messages_json("assistant", transcript),
+          GEN_AI_OUTPUT_MESSAGES,
+          _output_messages_json(transcript, finish_reason),
       )
   if audio_ref:
     span.set_attribute(GEN_AI_OUTPUT_EXPERIMENTAL_AUDIO_REF, audio_ref)

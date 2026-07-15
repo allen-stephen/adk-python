@@ -73,11 +73,19 @@ from typing import TYPE_CHECKING
 from google.genai import types
 from opentelemetry import context as context_api
 from opentelemetry import trace
+from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_AGENT_NAME
+from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import GEN_AI_CONVERSATION_ID
 from opentelemetry.trace import Span
+from opentelemetry.util.types import AttributeValue
 
 from . import _metrics
+from ._experimental_semconv import build_live_turn_operation_details
+from ._experimental_semconv import build_live_turn_request_details
+from ._experimental_semconv import maybe_log_completion_details
 from ._schema_version import resolve_schema_version
 from ._schema_version import SCHEMA_VERSION_SEMCONV_ALIGNED
+from .tracing import _telemetry_config_from_invocation_context
+from .tracing import otel_logger
 from .tracing import set_live_assistant_span_attributes
 from .tracing import set_live_turn_span_attributes
 from .tracing import set_live_user_span_attributes
@@ -85,6 +93,7 @@ from .tracing import tracer
 
 if TYPE_CHECKING:
   from ..agents.invocation_context import InvocationContext
+  from ..models.llm_request import LlmRequest
   from ..models.llm_response import LlmResponse
 
 # Span names. Kept ADK-native and aligned with the roles in a voice turn; the
@@ -183,8 +192,19 @@ class LiveTurnTracer:
       self,
       invocation_context: InvocationContext,
       parent_context: context_api.Context | None = None,
+      llm_request: LlmRequest | None = None,
   ):
     self._invocation_context = invocation_context
+    # The request that established the live connection. Its system instruction
+    # and tool declarations are stamped on each turn's inference completion
+    # event so offline evaluation (which reads
+    # `gen_ai.client.inference.operation.details`) has the agent's configuration.
+    # Computed once here since it does not change across the session's turns.
+    self._request_details: dict[str, AttributeValue] = (
+        build_live_turn_request_details(llm_request)
+        if llm_request is not None
+        else {}
+    )
     # Explicit parent OTel context for the `live_turn` span. In a concurrent
     # asyncio runtime the implicit "current span" is unreliable, and across a
     # multi-agent live session (agent transfer, sequential/loop sub-agents,
@@ -214,6 +234,11 @@ class LiveTurnTracer:
         types.GenerateContentResponseUsageMetadata | None
     ) = None
     self._finish_reason: types.FinishReason | None = None
+    # The turn's final input/output transcripts, captured as they settle and
+    # emitted as `gen_ai.input.messages` / `gen_ai.output.messages` in the
+    # turn's inference completion event at finalize.
+    self._input_transcript: str | None = None
+    self._output_transcript: str | None = None
     # Monotonic timestamp of the user's committed audio for the pending turn,
     # used to compute time-to-first-chunk. None when no turn is awaiting its
     # first model output.
@@ -367,6 +392,7 @@ class LiveTurnTracer:
       return
     if self._pending_finalize:
       self._finalize_turn()
+    self._input_transcript = transcript
     self._ensure_turn_span()
     if self._model_responded and self._user_span_closed:
       # Late transcript with no open user span: create one retroactively so the
@@ -387,16 +413,19 @@ class LiveTurnTracer:
       )
 
   def on_output_transcript(self, transcript: str) -> None:
-    """Attaches the model's (final) output transcript to the assistant span."""
+    """Captures the model's (final) output transcript for this turn.
+
+    The transcript is not stamped on the span here; it is emitted as
+    ``gen_ai.output.messages`` on the assistant span (and in the turn's
+    inference completion event) at finalize, so message serialization has a
+    single source of truth. This still opens the assistant span so its span
+    tree/ordering is unchanged.
+    """
     if not self._enabled or not transcript:
       return
+    self._output_transcript = transcript
     self._ensure_turn_span()
-    set_live_assistant_span_attributes(
-        self._ensure_assistant_span(),
-        self._invocation_context,
-        model=self._model_name(),
-        transcript=transcript,
-    )
+    self._ensure_assistant_span()
 
   def on_audio_reference(self, *, audio_ref: str, is_input: bool) -> None:
     """Attaches an input/output audio artifact reference to the right span."""
@@ -535,16 +564,19 @@ class LiveTurnTracer:
     # Fold the final generation's usage into the turn total (summing across a
     # tool-using turn's generations).
     self._fold_generation_usage()
-    # Stamp aggregated usage + finish reason on the assistant span, then close
-    # user, assistant, and turn spans (children before parent).
+    # Stamp aggregated usage + finish reason on the assistant span, emit the
+    # turn's inference completion details, then close user, assistant, and turn
+    # spans (children before parent).
     if self._assistant_span is not None:
       set_live_assistant_span_attributes(
           self._assistant_span,
           self._invocation_context,
+          transcript=self._output_transcript,
           usage_metadata=self._usage_total,
           finish_reason=self._finish_reason,
           event_id=self._assistant_event_id,
       )
+      self._emit_completion_details(self._assistant_span)
       self._assistant_span.end(end_time=end_ns)
       self._assistant_span = None
       self._assistant_event_id = None
@@ -562,6 +594,8 @@ class LiveTurnTracer:
     self._usage_total = None
     self._current_gen_usage = None
     self._finish_reason = None
+    self._input_transcript = None
+    self._output_transcript = None
     self._ttft_started_at = None
     self._ttft_recorded = False
     self._turn_started_at_ns = None
@@ -569,6 +603,45 @@ class LiveTurnTracer:
     self._first_model_output_ns = None
     self._model_responded = False
     self._tool_call_pending = False
+
+  def _emit_completion_details(self, assistant_span: Span) -> None:
+    """Emits the turn's `gen_ai.client.inference.operation.details` event.
+
+    Offline evaluation on the Gemini Enterprise Agent Platform reads this event
+    for the required inference signals: `input.messages` / `output.messages` /
+    `system_instructions` / `tool.definitions`, in the same shape as the
+    non-live path (reusing the shared builders).
+
+    This event is *optional* and off by default: like the non-live path it is
+    gated on the experimental GenAI semconv opt-in
+    (``should_use_experimental_genai_semconv``, inside
+    ``maybe_log_completion_details``), so developers who do not need it (e.g.
+    offline evaluation) pay nothing. This is independent of the transcript
+    attributes stamped on the `user` / `assistant` spans for the adk-web
+    inspector, which are gated only on content capture and therefore still
+    render without the semconv opt-in. Message content within the event is
+    additionally gated by the content-capture switches.
+    """
+    telemetry_config = _telemetry_config_from_invocation_context(
+        self._invocation_context
+    )
+    operation_details_attributes = build_live_turn_operation_details(
+        request_details=self._request_details,
+        input_transcript=self._input_transcript,
+        output_transcript=self._output_transcript,
+        finish_reason=self._finish_reason,
+    )
+    common_attributes: dict[str, AttributeValue] = {
+        GEN_AI_AGENT_NAME: self._invocation_context.agent.name,
+        GEN_AI_CONVERSATION_ID: self._invocation_context.session.id,
+    }
+    maybe_log_completion_details(
+        assistant_span,
+        otel_logger,
+        operation_details_attributes,
+        common_attributes,
+        telemetry_config,
+    )
 
   def _model_name(self) -> str | None:
     live_model = getattr(

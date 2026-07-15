@@ -645,3 +645,82 @@ def maybe_log_completion_details(
   )
   for key, value in span_attributes.items():
     span.set_attribute(key, _safe_json_serialize_no_whitespaces(value))
+
+
+# ---------------------------------------------------------------------------
+# Section E — Live (speech-to-speech) turn helpers
+# ---------------------------------------------------------------------------
+
+
+def transcript_to_content(role: str, transcript: str) -> types.Content:
+  """Wraps a plain transcript string into a ``types.Content``.
+
+  Live sessions surface user/model turns as transcript strings rather than the
+  ``types.Content`` objects the non-live path carries. Wrapping them here lets
+  the live path reuse the same message serializers (``_to_input_messages`` /
+  ``_to_output_message``) as the non-live path, so message serialization has a
+  single source of truth.
+  """
+  return types.Content(role=role, parts=[types.Part(text=transcript)])
+
+
+def build_live_turn_request_details(
+    llm_request: LlmRequest,
+) -> dict[str, AttributeValue]:
+  """Builds the request-side operation details for a live turn.
+
+  Only the system instructions and tool definitions are taken from the
+  ``LlmRequest``; the per-turn input messages are supplied separately from the
+  turn's actual input transcript (see ``build_live_turn_operation_details``),
+  because ``llm_request.contents`` only holds the seeded connect-time history,
+  not the turn the user just spoke.
+  """
+  return {
+      GEN_AI_SYSTEM_INSTRUCTIONS: _to_system_instructions(llm_request.config),
+      GEN_AI_TOOL_DEFINITIONS: _resolve_tool_definitions(
+          llm_request.config.tools or []
+      ),
+  }
+
+
+def transcript_to_output_messages(
+    transcript: str, finish_reason: types.FinishReason | None
+) -> list[OutputMessage]:
+  """Builds the ``gen_ai.output.messages`` payload from a model transcript.
+
+  Shared by the live turn's completion-details event and the ``assistant`` span
+  visualization so both serialize the model transcript identically.
+  """
+  return [
+      OutputMessage(
+          role='assistant',
+          parts=[Text(content=transcript, type='text')],
+          finish_reason=_to_finish_reason(finish_reason),
+      )
+  ]
+
+
+def build_live_turn_operation_details(
+    *,
+    request_details: Mapping[str, AttributeValue],
+    input_transcript: str | None,
+    output_transcript: str | None,
+    finish_reason: types.FinishReason | None,
+) -> dict[str, AttributeValue]:
+  """Assembles a live turn's operation-details attributes.
+
+  Reuses the non-live message serializers so a live turn's
+  ``gen_ai.client.inference.operation.details`` event carries the same
+  ``input.messages`` / ``output.messages`` / ``system_instructions`` /
+  ``tool.definitions`` shape as the non-live path.
+  """
+  attributes: dict[str, AttributeValue] = dict(request_details)
+  if input_transcript:
+    attributes[GEN_AI_INPUT_MESSAGES] = _to_input_messages(
+        [transcript_to_content('user', input_transcript)]
+    )
+  if output_transcript:
+    attributes[GEN_AI_OUTPUT_MESSAGES] = transcript_to_output_messages(
+        output_transcript, finish_reason
+    )
+  return attributes

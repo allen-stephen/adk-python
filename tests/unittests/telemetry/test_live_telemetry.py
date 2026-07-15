@@ -1169,3 +1169,322 @@ async def test_live_turn_without_parent_still_produces_turn():
   exporter = _run_tracer(ctx, _drive_one_turn)
 
   assert len(_spans_named(exporter, 'live_turn')) == 1
+
+
+# --- Offline-eval inference completion details -----------------------------
+#
+# Offline evaluation on the Gemini Enterprise Agent Platform reads the
+# `gen_ai.client.inference.operation.details` event (not span attributes) for
+# the required inference signals. These tests assert the live path emits that
+# event, with the same shape as the non-live path.
+# See docs/proposals/live-voice-telemetry.md and
+# https://docs.cloud.google.com/gemini-enterprise-agent-platform/optimize/evaluation/evaluate-offline
+
+COMPLETION_DETAILS_EVENT = 'gen_ai.client.inference.operation.details'
+
+
+def _event_telemetry(
+    content=ContentCapturingMode.SPAN_AND_EVENT,
+):
+  """A TelemetryConfig that opts in to the inference completion-details event.
+
+  The event is gated on the experimental GenAI semconv opt-in (matching the
+  non-live path), so it is off by default; these tests opt in explicitly.
+  """
+  return TelemetryConfig(
+      genai_semconv_stability_opt_in='experimental',
+      capture_message_content=content,
+  )
+
+
+def _capture_completion_events(monkeypatch):
+  """Captures `gen_ai.client.inference.operation.details` events.
+
+  Patches the shared `otel_logger.emit` (the same object the live tracer holds
+  a reference to) and returns a list that collects emitted LogRecords.
+  """
+  from google.adk.telemetry import tracing
+
+  records = []
+  monkeypatch.setattr(
+      tracing.otel_logger, 'emit', lambda record: records.append(record)
+  )
+  return records
+
+
+def _completion_events(records):
+  return [r for r in records if r.event_name == COMPLETION_DETAILS_EVENT]
+
+
+async def _drain_receive_with_request(
+    flow, mock_connection, invocation_context, llm_request
+):
+  """Like `_drain_receive`, but threads `llm_request` into the turn tracer."""
+  tracer, exporter, provider = _make_in_memory_tracer()
+  try:
+    with (
+        mock.patch('google.adk.flows.llm_flows.base_llm_flow.tracer', tracer),
+        mock.patch('google.adk.telemetry.live_turn_tracing.tracer', tracer),
+    ):
+      turn_tracer = LiveTurnTracer(invocation_context, llm_request=llm_request)
+      try:
+        async for _ in flow._receive_from_model(
+            mock_connection,
+            'seed_event_id',
+            invocation_context,
+            llm_request,
+            turn_tracer,
+        ):
+          pass
+      except _StopReceiveLoop:
+        pass
+      finally:
+        turn_tracer.close()
+  finally:
+    provider.shutdown()
+  return exporter
+
+
+def _first_message_text(messages):
+  return messages[0]['parts'][0]['content']
+
+
+@pytest.mark.asyncio
+async def test_live_turn_emits_inference_completion_details_event(monkeypatch):
+  """A live turn emits the offline-eval inference event with all four fields."""
+  records = _capture_completion_events(monkeypatch)
+  agent = Agent(name='test_agent')
+  ctx = await testing_utils.create_invocation_context(
+      agent=agent,
+      run_config=RunConfig(telemetry=_event_telemetry()),
+  )
+  flow = BaseLlmFlowForTesting()
+
+  llm_request = LlmRequest(
+      config=types.GenerateContentConfig(
+          system_instruction='you are a helpful weather agent',
+          tools=[
+              types.Tool(
+                  function_declarations=[
+                      types.FunctionDeclaration(
+                          name='get_weather',
+                          description='Look up the weather.',
+                      )
+                  ]
+              )
+          ],
+      )
+  )
+  conn = _mock_connection([
+      LlmResponse(
+          input_transcription=types.Transcription(
+              text='what is the weather', finished=True
+          )
+      ),
+      LlmResponse(
+          output_transcription=types.Transcription(
+              text='it is sunny', finished=True
+          )
+      ),
+      LlmResponse(turn_complete=True),
+  ])
+
+  await _drain_receive_with_request(flow, conn, ctx, llm_request)
+
+  events = _completion_events(records)
+  assert len(events) == 1
+  attrs = events[0].attributes
+  assert _first_message_text(attrs['gen_ai.input.messages']) == (
+      'what is the weather'
+  )
+  assert _first_message_text(attrs['gen_ai.output.messages']) == 'it is sunny'
+  # system_instructions is a flat list of parts (not messages).
+  assert attrs['gen_ai.system_instructions'][0]['content'] == (
+      'you are a helpful weather agent'
+  )
+  tool_defs = attrs['gen_ai.tool.definitions']
+  assert tool_defs[0]['name'] == 'get_weather'
+  # Common attributes correlate the event to the conversation/agent.
+  assert attrs['gen_ai.agent.name'] == 'test_agent'
+  assert attrs['gen_ai.conversation.id'] == ctx.session.id
+
+
+@pytest.mark.asyncio
+async def test_live_completion_details_stamped_on_assistant_span(monkeypatch):
+  """The same details land on the assistant span (single source of truth)."""
+  _capture_completion_events(monkeypatch)
+  agent = Agent(name='test_agent')
+  ctx = await testing_utils.create_invocation_context(
+      agent=agent,
+      run_config=RunConfig(telemetry=_event_telemetry()),
+  )
+  flow = BaseLlmFlowForTesting()
+
+  llm_request = LlmRequest(
+      config=types.GenerateContentConfig(
+          system_instruction='sys instr',
+      )
+  )
+  conn = _mock_connection([
+      LlmResponse(
+          output_transcription=types.Transcription(
+              text='hello there', finished=True
+          )
+      ),
+      LlmResponse(turn_complete=True),
+  ])
+
+  exporter = await _drain_receive_with_request(flow, conn, ctx, llm_request)
+
+  assistant = _spans_named(exporter, 'assistant')[0]
+  assert (
+      _transcript_text(assistant.attributes['gen_ai.output.messages'])
+      == 'hello there'
+  )
+  # On the span, attributes are JSON strings; system_instructions is a flat
+  # list of parts.
+  sys_instr = json.loads(assistant.attributes['gen_ai.system_instructions'])
+  assert sys_instr[0]['content'] == 'sys instr'
+
+
+@pytest.mark.asyncio
+async def test_live_completion_details_redacted_when_content_disabled(
+    monkeypatch,
+):
+  """Message content is dropped from the event when content capture is off."""
+  records = _capture_completion_events(monkeypatch)
+  agent = Agent(name='test_agent')
+  ctx = await testing_utils.create_invocation_context(
+      agent=agent,
+      run_config=RunConfig(
+          telemetry=_event_telemetry(content=ContentCapturingMode.NO_CONTENT)
+      ),
+  )
+  flow = BaseLlmFlowForTesting()
+
+  llm_request = LlmRequest(
+      config=types.GenerateContentConfig(system_instruction='secret sys instr')
+  )
+  conn = _mock_connection([
+      LlmResponse(
+          input_transcription=types.Transcription(
+              text='secret question', finished=True
+          )
+      ),
+      LlmResponse(
+          output_transcription=types.Transcription(
+              text='secret answer', finished=True
+          )
+      ),
+      LlmResponse(turn_complete=True),
+  ])
+
+  await _drain_receive_with_request(flow, conn, ctx, llm_request)
+
+  events = _completion_events(records)
+  assert len(events) == 1
+  attrs = events[0].attributes
+  # Content is elided; the event still fires (structure without content).
+  assert 'gen_ai.input.messages' not in attrs
+  assert 'gen_ai.output.messages' not in attrs
+
+
+@pytest.mark.asyncio
+async def test_legacy_schema_emits_no_completion_details(monkeypatch):
+  """Under the legacy schema the live path emits no inference event."""
+  monkeypatch.setenv('ADK_TELEMETRY_SCHEMA_VERSION_OPT_IN', '1')
+  records = _capture_completion_events(monkeypatch)
+  agent = Agent(name='test_agent')
+  ctx = await testing_utils.create_invocation_context(
+      agent=agent,
+      run_config=RunConfig(
+          telemetry=TelemetryConfig(
+              capture_message_content=ContentCapturingMode.SPAN_AND_EVENT
+          )
+      ),
+  )
+  flow = BaseLlmFlowForTesting()
+
+  conn = _mock_connection([
+      LlmResponse(
+          output_transcription=types.Transcription(text='hi', finished=True)
+      ),
+      LlmResponse(turn_complete=True),
+  ])
+
+  await _drain_receive_with_request(flow, conn, ctx, LlmRequest())
+
+  assert not _completion_events(records)
+
+
+@pytest.mark.asyncio
+async def test_no_completion_details_without_semconv_opt_in(monkeypatch):
+  """The event is off by default: no semconv opt-in means no inference event.
+
+  The live span tree still renders (it is gated on schema v2, forced on by the
+  autouse fixture); only the completion-details event is suppressed, so
+  developers who do not need offline eval pay nothing for it.
+  """
+  records = _capture_completion_events(monkeypatch)
+  agent = Agent(name='test_agent')
+  # Content capture is on, but the experimental semconv opt-in is absent.
+  ctx = await testing_utils.create_invocation_context(
+      agent=agent,
+      run_config=RunConfig(
+          telemetry=TelemetryConfig(
+              capture_message_content=ContentCapturingMode.SPAN_AND_EVENT
+          )
+      ),
+  )
+  flow = BaseLlmFlowForTesting()
+
+  conn = _mock_connection([
+      LlmResponse(
+          output_transcription=types.Transcription(text='hello', finished=True)
+      ),
+      LlmResponse(turn_complete=True),
+  ])
+
+  exporter = await _drain_receive_with_request(flow, conn, ctx, LlmRequest())
+
+  # The span tree is still emitted...
+  assert _spans_named(exporter, 'live_turn')
+  # ...but the inference completion-details event is not.
+  assert not _completion_events(records)
+
+
+@pytest.mark.asyncio
+async def test_tool_call_turn_emits_single_completion_details_event(
+    monkeypatch,
+):
+  """A tool round-trip (two generations) emits one per-turn inference event."""
+  records = _capture_completion_events(monkeypatch)
+  agent = Agent(name='test_agent')
+  ctx = await testing_utils.create_invocation_context(
+      agent=agent,
+      run_config=RunConfig(telemetry=_event_telemetry()),
+  )
+
+  def drive(t):
+    t.on_user_audio()
+    # First generation: function call, ended by a handoff turn_complete.
+    t.on_model_output(_function_call())
+    t.on_turn_boundary(LlmResponse(turn_complete=True))
+    # Second generation: the spoken answer, ended by the real turn_complete.
+    t.on_model_output(_audio_chunk())
+    t.on_output_transcript('it is sunny')
+    t.on_turn_boundary(LlmResponse(turn_complete=True))
+    t.on_usage(_usage_only())
+
+  tracer, _, provider = _make_in_memory_tracer()
+  try:
+    with mock.patch('google.adk.telemetry.live_turn_tracing.tracer', tracer):
+      turn_tracer = LiveTurnTracer(ctx)
+      drive(turn_tracer)
+      turn_tracer.close()
+  finally:
+    provider.shutdown()
+
+  # One conversational turn -> exactly one inference event, despite two
+  # generations.
+  assert len(_completion_events(records)) == 1

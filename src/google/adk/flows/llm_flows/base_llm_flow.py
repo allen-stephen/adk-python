@@ -561,7 +561,9 @@ class BaseLlmFlow(ABC):
     # (agent transfer, sequential/loop sub-agents), where each sub-agent's
     # `run_live` establishes its own agent span.
     live_turn_tracer = LiveTurnTracer(
-        invocation_context, parent_context=context_api.get_current()
+        invocation_context,
+        parent_context=context_api.get_current(),
+        llm_request=llm_request,
     )
 
     llm = self.__get_llm(invocation_context)
