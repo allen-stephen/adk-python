@@ -105,6 +105,7 @@ optional-dependencies.all = [
   "langgraph>=1.0.10,<2",
   "langgraph-checkpoint>=4.1.1,<5",
   "litellm>=1.84",
+  "livekit-agents[images]>=1,<2",
   "llama-index-embeddings-google-genai>=0.3",
   "llama-index-readers-file>=0.4",
   "lxml>=5.3",
@@ -241,6 +242,8 @@ optional-dependencies.gcp = [
   "opentelemetry-resourcedetector-gcp>=1.9.0a0,<2",
   "python-dateutil>=2.9.0.post0,<3",
 ]
+# The [images] extra pulls Pillow, used to JPEG-encode inbound video frames.
+optional-dependencies.livekit = [ "livekit-agents[images]>=1,<2" ]
 optional-dependencies.mcp = [
   "anyio>=4.9,<5",
   "mcp>=1.24,<2",
@@ -293,6 +296,7 @@ optional-dependencies.test = [
   "langgraph>=1.0.10,<2",
   "langgraph-checkpoint>=4.1.1,<5",                                  # LangGraph's own floor still admits unsafe checkpoint deserialization.
   "litellm>=1.84",
+  "livekit-agents[images]>=1,<2",
   "llama-index-readers-file>=0.4",
   "lxml>=5.3",
   "mcp>=1.24,<2",

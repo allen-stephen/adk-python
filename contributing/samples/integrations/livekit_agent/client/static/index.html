@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ADK × LiveKit — Dice Agent</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <!-- LiveKit's own client SDK, unmodified, from a CDN (no build step). -->
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+  </head>
+  <body>
+    <main class="card">
+      <h1>Talk to the dice agent</h1>
+      <p class="subtitle">
+        Your mic streams into a LiveKit room; the ADK worker is dispatched in to
+        answer. Try: <em>"roll a 20 sided die and tell me if it's prime."</em>
+      </p>
+
+      <button id="talk" class="btn">Start talking</button>
+
+      <div class="status">
+        <span id="dot" class="dot"></span>
+        <span id="state">Idle</span>
+      </div>
+
+      <!-- The agent's audio track is attached here so you can hear it. -->
+      <div id="audio-container" hidden></div>
+
+      <!-- Live transcript, fed by the connector's room data track. -->
+      <div id="transcript" class="transcript" aria-live="polite"></div>
+
+      <!-- Text input travels over the same data track as a user turn. -->
+      <form id="say-form" class="say" autocomplete="off">
+        <input
+          id="say"
+          class="say-input"
+          type="text"
+          placeholder="…or type instead of talking"
+          disabled
+        />
+        <button id="send" class="btn btn-secondary" type="submit" disabled>
+          Send
+        </button>
+      </form>
+
+      <pre id="log" class="log" aria-live="polite"></pre>
+    </main>
+
+    <script src="/static/script.js"></script>
+  </body>
+</html>
