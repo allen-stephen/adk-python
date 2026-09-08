@@ -15,19 +15,22 @@
 """Tools that let a live agent act on the call it is on.
 
 The docstrings below are what the model reads, so they address the model
-rather than the developer.
+rather than the developer. `tool_context` is supplied by ADK and dropped from
+the declaration the model sees, so it is deliberately absent from the `Args:`
+sections.
 """
 
 from __future__ import annotations
 
 import logging
 
-from ._call_context import current_call
+from ...tools.tool_context import ToolContext
+from ._livekit_call import current_call
 
 logger = logging.getLogger("google_adk." + __name__)
 
 
-async def end_call() -> str:
+async def end_call(tool_context: ToolContext) -> str:
   """Hangs up and ends the conversation.
 
   Call this once the caller has said goodbye or their request is resolved.
@@ -35,7 +38,7 @@ async def end_call() -> str:
   Returns:
     A confirmation that the call is ending.
   """
-  call = current_call()
+  call = current_call(tool_context)
   logger.info("Agent ending call for session %s.", call.session_id)
   try:
     await call.hang_up()
@@ -47,7 +50,7 @@ async def end_call() -> str:
   return "The call is ending."
 
 
-async def transfer_call(transfer_to: str) -> str:
+async def transfer_call(transfer_to: str, tool_context: ToolContext) -> str:
   """Transfers the caller to another phone number or SIP address.
 
   Only works on a phone call. Tell the caller they are being transferred
@@ -60,7 +63,7 @@ async def transfer_call(transfer_to: str) -> str:
   Returns:
     A confirmation, or an explanation of why the transfer could not happen.
   """
-  call = current_call()
+  call = current_call(tool_context)
   destination = (
       transfer_to
       if transfer_to.startswith(("tel:", "sip:"))
@@ -75,7 +78,7 @@ async def transfer_call(transfer_to: str) -> str:
   return f"Transferring the caller to {transfer_to}."
 
 
-async def send_dtmf(digits: str) -> str:
+async def send_dtmf(digits: str, tool_context: ToolContext) -> str:
   """Presses keys on the phone keypad, to drive an automated phone menu.
 
   Args:
@@ -84,6 +87,6 @@ async def send_dtmf(digits: str) -> str:
   Returns:
     A confirmation of what was sent.
   """
-  call = current_call()
+  call = current_call(tool_context)
   await call.send_dtmf(digits)
   return f"Sent the tones {digits}."

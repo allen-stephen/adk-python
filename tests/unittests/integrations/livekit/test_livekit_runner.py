@@ -211,8 +211,9 @@ async def test_the_default_run_config_survives_a_reconnect():
 async def test_the_default_run_config_produces_captions():
   """`lk.transcription` is silent unless transcription is asked for.
 
-  ADK enables it by itself only for an agent with `sub_agents`, so a plain
-  agent would publish audio and no captions to go with it.
+  `RunConfig` defaults both transcription fields to enabled, so the connector
+  does nothing here. Asserted anyway: if that default ever flips back to None,
+  captions stop and this is the test that says why.
   """
   runner = _make_runner([])
   lk_runner = make_lk_runner(runner, make_room())
@@ -224,18 +225,77 @@ async def test_the_default_run_config_produces_captions():
   assert run_config.output_audio_transcription is not None
 
 
-async def test_run_config_is_used_when_provided():
-  """A caller-supplied run_config is passed through untouched."""
+async def test_a_partial_run_config_keeps_its_own_settings():
+  """A caller who sets one field must not lose the rest of their config."""
+  transcription = types.AudioTranscriptionConfig()
   run_config = RunConfig(
       response_modalities=[types.Modality.AUDIO],
-      output_audio_transcription=types.AudioTranscriptionConfig(),
+      output_audio_transcription=transcription,
+      max_llm_calls=7,
   )
   runner = _make_runner([])
   lk_runner = make_lk_runner(runner, make_room(), run_config=run_config)
 
   await lk_runner._forward_events()
 
-  assert runner.live_kwargs["run_config"] is run_config
+  used = runner.live_kwargs["run_config"]
+  assert used.output_audio_transcription is transcription
+  assert used.max_llm_calls == 7
+
+
+async def test_a_partial_run_config_gains_the_voice_defaults():
+  """Supplying a run_config for one reason must not mute the call.
+
+  A config built to set `max_llm_calls` used to replace the defaults
+  wholesale, dropping audio output and resumption without saying so.
+  """
+  runner = _make_runner([])
+  lk_runner = make_lk_runner(
+      runner, make_room(), run_config=RunConfig(max_llm_calls=7)
+  )
+
+  await lk_runner._forward_events()
+
+  used = runner.live_kwargs["run_config"]
+  assert used.response_modalities == [types.Modality.AUDIO]
+  assert used.session_resumption is not None
+
+
+async def test_the_callers_run_config_is_left_alone():
+  """The caller's object may be a shared module-level default."""
+  run_config = RunConfig(max_llm_calls=7)
+  runner = _make_runner([])
+  lk_runner = make_lk_runner(runner, make_room(), run_config=run_config)
+
+  await lk_runner._forward_events()
+
+  assert run_config.session_resumption is None
+  assert run_config.response_modalities is None
+  assert runner.live_kwargs["run_config"] is not run_config
+
+
+async def test_transcription_can_still_be_switched_off():
+  """`None` is the only way to say "no captions", so it has to survive.
+
+  Transcription defaults to on, so filling a `None` back in would enable it
+  for a caller who had just gone out of their way to disable it.
+  """
+  runner = _make_runner([])
+  lk_runner = make_lk_runner(
+      runner,
+      make_room(),
+      run_config=RunConfig(
+          input_audio_transcription=None, output_audio_transcription=None
+      ),
+  )
+
+  await lk_runner._forward_events()
+
+  used = runner.live_kwargs["run_config"]
+  assert used.input_audio_transcription is None
+  assert used.output_audio_transcription is None
+  # The fields it does fill are unaffected.
+  assert used.response_modalities == [types.Modality.AUDIO]
 
 
 async def test_output_audio_is_played_out_before_the_session_returns():

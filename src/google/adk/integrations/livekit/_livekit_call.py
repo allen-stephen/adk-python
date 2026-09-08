@@ -14,9 +14,11 @@
 
 """Access to the in-progress LiveKit call from inside an ADK tool.
 
-`Runner.run_live()` takes ids and a queue, so a tool has no parameter through
-which to reach the room. `LiveKitRunner` publishes the call on a `ContextVar`
-instead, which ADK copies when it dispatches a tool.
+`Runner.run_live()` takes ids and a queue, so there is no parameter through
+which to hand a tool the room. What a tool does get is its `ToolContext`, and
+that already names the session the call belongs to, so `LiveKitRunner`
+registers the call under `(user_id, session_id)` for the duration and
+`current_call()` looks it up from the context.
 """
 
 from __future__ import annotations
@@ -24,13 +26,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from collections.abc import Iterator
 import contextlib
-import contextvars
 import logging
 from types import ModuleType
 from typing import Optional
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+  from ...agents.readonly_context import ReadonlyContext
+  from ...tools.tool_context import ToolContext
   from ._rtc import rtc
 
 logger = logging.getLogger("google_adk." + __name__)
@@ -281,26 +284,31 @@ _DTMF_CODES: dict[str, int] = {
     "D": 15,
 }
 
-_CURRENT_CALL: contextvars.ContextVar[LiveKitCall] = contextvars.ContextVar(
-    "google_adk_livekit_current_call"
-)
+# The calls this process is currently serving, keyed by the ADK session each
+# one drives. A session is the natural key because it is the only thing both
+# sides already know: `LiveKitRunner` is constructed with it, and a tool reads
+# it back off its context.
+_ACTIVE_CALLS: dict[tuple[str, str], LiveKitCall] = {}
 
 
-def _current_call_or_none() -> Optional[LiveKitCall]:
-  """Returns the in-progress call, or None when there is no LiveKit session."""
-  return _CURRENT_CALL.get(None)
+def _call_for_context(context: ReadonlyContext) -> Optional[LiveKitCall]:
+  """Returns the call this context belongs to, or None if there is no call."""
+  return _ACTIVE_CALLS.get((context.user_id, context.session.id))
 
 
-def current_call() -> LiveKitCall:
+def current_call(tool_context: ToolContext) -> LiveKitCall:
   """Returns the LiveKit call the calling tool is running inside.
+
+  Args:
+    tool_context: The tool's context, which names the session the call is on.
 
   Returns:
     The in-progress call.
 
   Raises:
-    RuntimeError: If no LiveKit call is in progress.
+    RuntimeError: If no LiveKit call is in progress for this session.
   """
-  call = _CURRENT_CALL.get(None)
+  call = _call_for_context(tool_context)
   if call is None:
     raise RuntimeError(
         "No LiveKit call is in progress. `current_call()` only works inside an"
@@ -311,14 +319,28 @@ def current_call() -> LiveKitCall:
 
 
 @contextlib.contextmanager
-def _use_call(call: LiveKitCall) -> Iterator[None]:
-  """Publishes `call` to tools for the duration of the block.
+def _register_call(call: LiveKitCall) -> Iterator[None]:
+  """Publishes `call` to the tools on its session, for the block's duration.
 
-  Must wrap the task that drives `run_live`, since ADK snapshots the ambient
-  context when it dispatches a tool.
+  Args:
+    call: The call to publish.
+
+  Yields:
+    None, with the call registered.
+
+  Raises:
+    RuntimeError: If a call is already registered on the same session, which
+      would otherwise leave the two silently sharing a room.
   """
-  token = _CURRENT_CALL.set(call)
+  key = (call.user_id, call.session_id)
+  if key in _ACTIVE_CALLS:
+    raise RuntimeError(
+        f"A LiveKit call is already in progress for session {call.session_id!r}"
+        f" of user {call.user_id!r}. Give each concurrent call its own session"
+        " id."
+    )
+  _ACTIVE_CALLS[key] = call
   try:
     yield
   finally:
-    _CURRENT_CALL.reset(token)
+    _ACTIVE_CALLS.pop(key, None)

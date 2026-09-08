@@ -55,7 +55,7 @@ your Vertex/Gemini credentials for `gemini-live-2.5-flash-native-audio`.
 
 ```bash
 pip install "google-adk[livekit]" fastapi uvicorn
-python -m contributing.samples.integrations.livekit_agent.quickstart
+python -m contributing.samples.integrations.livekit.quickstart
 ```
 
 Open <http://localhost:8080> and click **Start talking**. Microphone and camera
@@ -74,13 +74,13 @@ pip install "google-adk[livekit]" "livekit-agents>=1.4" fastapi uvicorn
 Terminal 1, the ADK worker:
 
 ```bash
-python -m contributing.samples.integrations.livekit_agent.livekit_worker start
+python -m contributing.samples.integrations.livekit.livekit_worker start
 ```
 
 Terminal 2, the token and dispatch server, which also serves the client:
 
 ```bash
-python -m contributing.samples.integrations.livekit_agent.client.main
+python -m contributing.samples.integrations.livekit.client.main
 ```
 
 Open <http://localhost:8080> and talk, as above. To check the worker without a

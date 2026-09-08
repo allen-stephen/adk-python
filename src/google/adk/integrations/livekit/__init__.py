@@ -24,28 +24,28 @@ from __future__ import annotations
 import typing
 
 if typing.TYPE_CHECKING:
-  from ._call_context import current_call
-  from ._call_context import LiveKitCall
-  from ._call_tools import end_call
-  from ._call_tools import send_dtmf
-  from ._call_tools import transfer_call
-  from ._call_toolset import LiveKitToolset
+  from ._livekit_call import current_call
+  from ._livekit_call import LiveKitCall
   from ._livekit_runner import DATA_TOPIC
   from ._livekit_runner import LiveKitRunner
   from ._livekit_runner import LK_CHAT_TOPIC
+  from ._livekit_tools import end_call
+  from ._livekit_tools import send_dtmf
+  from ._livekit_tools import transfer_call
+  from ._livekit_toolset import LiveKitToolset
   from ._transcripts import LK_TRANSCRIPTION_TOPIC
 
 _lazy_imports = {
     "DATA_TOPIC": "._livekit_runner",
     "LK_CHAT_TOPIC": "._livekit_runner",
     "LK_TRANSCRIPTION_TOPIC": "._transcripts",
-    "LiveKitCall": "._call_context",
+    "LiveKitCall": "._livekit_call",
     "LiveKitRunner": "._livekit_runner",
-    "LiveKitToolset": "._call_toolset",
-    "current_call": "._call_context",
-    "end_call": "._call_tools",
-    "send_dtmf": "._call_tools",
-    "transfer_call": "._call_tools",
+    "LiveKitToolset": "._livekit_toolset",
+    "current_call": "._livekit_call",
+    "end_call": "._livekit_tools",
+    "send_dtmf": "._livekit_tools",
+    "transfer_call": "._livekit_tools",
 }
 
 __all__ = sorted(_lazy_imports)

@@ -16,16 +16,24 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+from google.adk.agents.invocation_context import InvocationContext
+from google.adk.runners import Runner
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.sessions.session import Session
+from google.adk.tools.tool_context import ToolContext
 import pytest
 
 pytest.importorskip("livekit.rtc")
 
 from google.adk.integrations.livekit import _livekit_runner
 from google.adk.integrations.livekit import _transcripts as _transcripts_module
+from google.adk.integrations.livekit import LiveKitCall
 from google.adk.integrations.livekit import LiveKitRunner
 from livekit import rtc
 
@@ -134,6 +142,77 @@ def make_lk_runner(runner, room, **kwargs) -> LiveKitRunner:
   lk_runner._audio_source.capture_frame = AsyncMock()
   lk_runner._audio_source.wait_for_playout = AsyncMock()
   return lk_runner
+
+
+def make_call(
+    room=None,
+    hang_up_callback=None,
+    user_id: str = "u1",
+    session_id: str = "s1",
+) -> LiveKitCall:
+  """A call handle over `room`, on the session `make_tool_context` names."""
+  return LiveKitCall(
+      room=room or make_room(),
+      user_id=user_id,
+      session_id=session_id,
+      hang_up_callback=hang_up_callback or (lambda: None),
+  )
+
+
+def idle_runner() -> Runner:
+  """A Runner whose `run_live` never finishes, like a real idle call."""
+  runner = MagicMock(spec=Runner)
+  runner.app_name = "test_app"
+  runner.session_service = MagicMock()
+  runner.session_service.get_session = AsyncMock(return_value=MagicMock())
+
+  async def run_live(**kwargs):
+    await asyncio.Event().wait()
+    yield  # pragma: no cover - unreachable, keeps this an async generator
+
+  runner.run_live = run_live
+  return runner
+
+
+@contextlib.asynccontextmanager
+async def patched_livekit_api():
+  """Patches LiveKit's server API and yields the client the code will use."""
+  from livekit import api
+
+  client = MagicMock()
+  client.sip.transfer_sip_participant = AsyncMock()
+  client.room.delete_room = AsyncMock()
+
+  @contextlib.asynccontextmanager
+  async def _session(*args, **kwargs):
+    del args, kwargs
+    yield client
+
+  with patch.object(api, "LiveKitAPI", _session):
+    yield client
+
+
+def transfer_request(client):
+  """The `TransferSIPParticipantRequest` sent through a patched API client."""
+  return client.sip.transfer_sip_participant.await_args.args[0]
+
+
+def make_tool_context(
+    user_id: str = "u1", session_id: str = "s1"
+) -> ToolContext:
+  """The context ADK hands a tool, naming the session the call is on.
+
+  Real rather than a mock, because the lookup reads `user_id` and `session.id`
+  off it and a mock would answer those whatever the plumbing did.
+  """
+  return ToolContext(
+      InvocationContext(
+          session_service=InMemorySessionService(),
+          invocation_id="test-invocation",
+          agent=None,
+          session=Session(id=session_id, app_name="test_app", user_id=user_id),
+      )
+  )
 
 
 def _transcripts(room) -> list[FakeTextStreamWriter]:

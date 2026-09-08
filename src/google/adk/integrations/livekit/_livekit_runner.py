@@ -42,11 +42,11 @@ from ...events.event import Event
 from ...features import experimental
 from ...features import FeatureName
 from ...runners import Runner
-from ._call_context import _use_call
-from ._call_context import LiveKitCall
-from ._call_context import SIP_CALL_ID_ATTRIBUTE
-from ._call_context import SIP_PHONE_NUMBER_ATTRIBUTE
-from ._call_context import SIP_TRUNK_PHONE_NUMBER_ATTRIBUTE
+from ._livekit_call import _register_call
+from ._livekit_call import LiveKitCall
+from ._livekit_call import SIP_CALL_ID_ATTRIBUTE
+from ._livekit_call import SIP_PHONE_NUMBER_ATTRIBUTE
+from ._livekit_call import SIP_TRUNK_PHONE_NUMBER_ATTRIBUTE
 from ._rtc import EventTypes
 from ._rtc import rtc
 from ._transcripts import TranscriptSegment
@@ -141,8 +141,9 @@ class LiveKitRunner:
       room: An already-connected LiveKit room.
       user_id: The ADK user id for the session.
       session_id: The ADK session id for the session.
-      run_config: Replaces the default voice config wholesale. Set
-        `session_resumption` and the transcription options yourself.
+      run_config: Extends the defaults rather than replacing them. Audio out
+        and session resumption are filled in if you leave them unset;
+        everything else, transcription included, is yours.
       create_session: Whether to create the ADK session if it is missing.
       wait_for_participant: Seconds to wait for a caller to join before
         opening the model connection. Pass None to start immediately.
@@ -151,7 +152,7 @@ class LiveKitRunner:
     self._room = room
     self._user_id = user_id
     self._session_id = session_id
-    self._run_config = run_config or _default_run_config()
+    self._run_config = _with_live_defaults(run_config)
     self._create_session = create_session
     self._wait_for_participant = wait_for_participant
     self._queue = LiveRequestQueue()
@@ -194,48 +195,55 @@ class LiveKitRunner:
 
     Returns when the caller hangs up, the room closes, or `run_live` finishes.
     Releases the room and closes the queue either way, setup failures included.
+
+    Raises:
+      RuntimeError: If another call is already in progress on this session.
     """
     self._loop = asyncio.get_running_loop()
     # Named up front: teardown runs even if setup fails before these exist.
     session: Optional[asyncio.Task[None]] = None
     hung_up: Optional[asyncio.Task[bool]] = None
-    try:
-      await self._publish_output_audio_track()
-      await self._set_agent_state(_STATE_INITIALIZING)
-      # Before the session is created, so caller identity is in the session
-      # state from the first turn rather than arriving later as a delta.
-      await self._await_participant()
-      if self._create_session:
-        await self._ensure_session()
-      self._subscribe_existing_tracks()
-      self._subscribe_room_events()
+    # Registered around the whole call rather than around `run_live`, so a
+    # tool still resolves it during teardown, and deregistered on the way out
+    # however the call ends.
+    with _register_call(self._call):
+      try:
+        await self._publish_output_audio_track()
+        await self._set_agent_state(_STATE_INITIALIZING)
+        # Before the session is created, so caller identity is in the session
+        # state from the first turn rather than arriving later as a delta.
+        await self._await_participant()
+        if self._create_session:
+          await self._ensure_session()
+        self._subscribe_existing_tracks()
+        self._subscribe_room_events()
 
-      # The session ends on whichever comes first: `run_live` finishing, or
-      # the call ending. Hanging up cannot be signalled by closing the queue
-      # -- `run_live` reads the resulting connection close as a dropped
-      # connection and reconnects on the resumption handle -- so it is
-      # tracked separately and cancels the event pump.
-      session = asyncio.create_task(self._forward_events())
-      hung_up = asyncio.create_task(self._ended.wait())
-      done, _ = await asyncio.wait(
-          {session, hung_up}, return_when=asyncio.FIRST_COMPLETED
-      )
-      if session in done:
-        session.result()  # Re-raise whatever ended the session.
-    finally:
-      if self._dtmf_flush_handle is not None:
-        self._dtmf_flush_handle.cancel()
-      started: list[asyncio.Task[Any]] = [
-          task for task in (session, hung_up) if task is not None
-      ]
-      pending = [*started, *self._forward_tasks]
-      for task in pending:
-        task.cancel()
-      # Awaited, and not merely cancelled, because a forwarder's `finally`
-      # still pushes onto the queue we are about to close.
-      await asyncio.gather(*pending, return_exceptions=True)
-      self._unsubscribe_room_events()
-      self._queue.close()
+        # The session ends on whichever comes first: `run_live` finishing, or
+        # the call ending. Hanging up cannot be signalled by closing the queue
+        # -- `run_live` reads the resulting connection close as a dropped
+        # connection and reconnects on the resumption handle -- so it is
+        # tracked separately and cancels the event pump.
+        session = asyncio.create_task(self._forward_events())
+        hung_up = asyncio.create_task(self._ended.wait())
+        done, _ = await asyncio.wait(
+            {session, hung_up}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if session in done:
+          session.result()  # Re-raise whatever ended the session.
+      finally:
+        if self._dtmf_flush_handle is not None:
+          self._dtmf_flush_handle.cancel()
+        started: list[asyncio.Task[Any]] = [
+            task for task in (session, hung_up) if task is not None
+        ]
+        pending = [*started, *self._forward_tasks]
+        for task in pending:
+          task.cancel()
+        # Awaited, and not merely cancelled, because a forwarder's `finally`
+        # still pushes onto the queue we are about to close.
+        await asyncio.gather(*pending, return_exceptions=True)
+        self._unsubscribe_room_events()
+        self._queue.close()
 
   def _subscribe_room_events(self) -> None:
     """Wires the room's callbacks to this session."""
@@ -598,31 +606,28 @@ class LiveKitRunner:
 
   async def _forward_events(self) -> None:
     """Drives `run_live` and pushes agent output back into the room."""
-    # Set on this task, not in `start`: only descendants of the task that
-    # drives the agent inherit the context a tool is dispatched with.
-    with _use_call(self._call):
-      self._start_playback()
-      try:
-        events = self._runner.run_live(
-            user_id=self._user_id,
-            session_id=self._session_id,
-            live_request_queue=self._queue,
-            run_config=self._run_config,
-        )
-        await self._set_agent_state(_STATE_LISTENING)
-        # `aclosing` so cancelling this task also unwinds `run_live` and
-        # closes the model connection.
-        async with contextlib.aclosing(events) as event_stream:
-          await self._pump_events(event_stream)
-        # Ended on its own, so let queued speech finish rather than cutting
-        # the agent off mid-word.
-        await self._drain_playback()
-      finally:
-        # Suppressed: an exception from the pump is the interesting one.
-        with contextlib.suppress(Exception):
-          await self._stop_playback()
-        with contextlib.suppress(Exception):
-          await self._close_segments()
+    self._start_playback()
+    try:
+      events = self._runner.run_live(
+          user_id=self._user_id,
+          session_id=self._session_id,
+          live_request_queue=self._queue,
+          run_config=self._run_config,
+      )
+      await self._set_agent_state(_STATE_LISTENING)
+      # `aclosing` so cancelling this task also unwinds `run_live` and
+      # closes the model connection.
+      async with contextlib.aclosing(events) as event_stream:
+        await self._pump_events(event_stream)
+      # Ended on its own, so let queued speech finish rather than cutting
+      # the agent off mid-word.
+      await self._drain_playback()
+    finally:
+      # Suppressed: an exception from the pump is the interesting one.
+      with contextlib.suppress(Exception):
+        await self._stop_playback()
+      with contextlib.suppress(Exception):
+        await self._close_segments()
 
   async def _pump_events(self, event_stream: AsyncIterator[Event]) -> None:
     """Pushes each agent event out to the room."""
@@ -811,20 +816,37 @@ def _next_agent_state(event: Event, has_audio: bool) -> Optional[str]:
   return None
 
 
-def _default_run_config() -> RunConfig:
-  """Builds the default voice config.
+def _with_live_defaults(run_config: Optional[RunConfig]) -> RunConfig:
+  """Completes a run config with the settings a voice call needs.
 
-  Resumption is on because the history ADK replays on reconnect is assembled
-  before the call, so without a handle a reconnect loses the conversation.
-  Transcription is on because ADK enables it by itself only for an agent with
-  `sub_agents`, and without it `lk.transcription` is silent.
+  Only unset fields are filled, so a caller's own choices survive and a config
+  supplied for one reason does not silently drop the voice basics.
+
+  Two fields need filling. `response_modalities`, because the transport
+  carries speech and ADK's own default is text. `session_resumption`, because
+  the history ADK replays on reconnect is assembled before the call, so
+  without a handle a reconnect loses the conversation.
+
+  Transcription is deliberately not touched. Both `RunConfig` transcription
+  fields already default to enabled, which is what feeds `lk.transcription`,
+  so `None` here is a caller switching captions off rather than a caller who
+  forgot -- and overriding that would leave no way to switch them off at all.
+
+  Args:
+    run_config: The caller's config, or None to build one from scratch.
+
+  Returns:
+    A new config; the caller's own instance is left untouched.
   """
-  return RunConfig(
-      response_modalities=[types.Modality.AUDIO],
-      input_audio_transcription=types.AudioTranscriptionConfig(),
-      output_audio_transcription=types.AudioTranscriptionConfig(),
-      session_resumption=types.SessionResumptionConfig(),
-  )
+  run_config = run_config or RunConfig()
+  updates: dict[str, Any] = {}
+
+  if run_config.response_modalities is None:
+    updates["response_modalities"] = [types.Modality.AUDIO]
+  if run_config.session_resumption is None:
+    updates["session_resumption"] = types.SessionResumptionConfig()
+
+  return run_config.model_copy(update=updates)
 
 
 def _encode_jpeg(frame: rtc.VideoFrame) -> bytes:

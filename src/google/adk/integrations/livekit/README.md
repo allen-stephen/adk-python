@@ -141,24 +141,32 @@ call cannot honor:
 | WebRTC | `end_call` |
 | SIP | `end_call`, `transfer_call`, `send_dtmf` |
 
-`LiveKitToolset` takes `BaseToolset`'s usual arguments, so pass
+`LiveKitToolset` takes `tool_filter` and `tool_name_prefix`, so pass
 `tool_filter=["transfer_call", "send_dtmf"]` for an agent that should never
 decide the conversation is over. The three tools are also importable
 individually if you would rather list them yourself.
 
 ### Your own tools
 
-`Runner.run_live()` takes ids and a queue, so a tool has no parameter through
-which to reach the room. The connector publishes the call on a context
-variable that tools read with `current_call()`:
+`Runner.run_live()` takes ids and a queue, so there is no parameter through
+which to hand a tool the room. What a tool does get is its `ToolContext`, and
+that already names the session the call is on, so ask `current_call()` for the
+call that context belongs to:
 
 ```python
 from google.adk.integrations.livekit import current_call
+from google.adk.tools.tool_context import ToolContext
 
-async def open_the_door(door_id: str) -> str:
+async def open_the_door(door_id: str, tool_context: ToolContext) -> str:
   """Opens a door in the game world."""
-  return await current_call().perform_rpc(method="open_door", payload=door_id)
+  call = current_call(tool_context)
+  return await call.perform_rpc(method="open_door", payload=door_id)
 ```
+
+ADK supplies `tool_context` and strips it from the declaration the model sees,
+so it costs the model nothing. Because the call is looked up per session
+rather than inherited, one process can serve several calls at once and a sync
+tool on a worker thread resolves it the same way an async one does.
 
 `LiveKitCall` exposes `room`, `caller_phone_number`, `sip_attributes()`,
 `send_dtmf()`, `send_data()`, `perform_rpc()`, `transfer()` and
@@ -170,7 +178,7 @@ an open line.
 
 Outside a LiveKit session `current_call()` raises, so a tool of your own
 belongs where you wire the transport unless it can tolerate that. The toolset
-has no such constraint.
+has no such constraint: with no call on the session it offers nothing.
 
 ## Telephony
 
@@ -200,22 +208,24 @@ trunk with `"numbers": []` exercises them without a phone number.
 
 ## Run config
 
-The default is audio out, captions both ways, and session resumption:
+Without a `run_config` you get audio out, captions both ways, and session
+resumption. Pass one and it is extended rather than replaced, so a config you
+built for something else does not have to restate the voice basics:
 
 ```python
-run_config = RunConfig(
-    response_modalities=[types.Modality.AUDIO],
-    input_audio_transcription=types.AudioTranscriptionConfig(),
-    output_audio_transcription=types.AudioTranscriptionConfig(),
-    session_resumption=types.SessionResumptionConfig(),
-)
+# Still audio out, still captioned, still resumable.
+run_config = RunConfig(max_llm_calls=50)
 ```
 
-Your own `run_config` replaces that wholesale, so copy the lines you still
-want. Without `session_resumption` a reconnect loses the conversation, since
-the history ADK replays is assembled before the call. Without the two
-transcription configs `lk.transcription` is silent, since ADK enables them by
-itself only for an agent with `sub_agents`.
+Two fields are filled in when you leave them unset. `response_modalities`
+becomes `[AUDIO]`, because ADK's own default is text. `session_resumption`
+gets a handle, because without one a reconnect loses the conversation — the
+history ADK replays is assembled before the call.
+
+Transcription is left alone, because `RunConfig` already defaults both
+`input_audio_transcription` and `output_audio_transcription` to enabled. That
+is what feeds `lk.transcription`, so captions work by default and setting
+either to `None` is how you turn them off.
 
 A `Workflow` root also works, opening one model connection per stage. Expect a
 gap of about a second at each handoff.
@@ -230,5 +240,5 @@ gap of about a second at each handoff.
   task, which is what lets barge-in drop unplayed speech immediately.
 
 See
-[`contributing/samples/integrations/livekit_agent`](../../../../../contributing/samples/integrations/livekit_agent/README.md)
+[`contributing/samples/integrations/livekit`](../../../../../contributing/samples/integrations/livekit/README.md)
 for a runnable sample of both topologies.
